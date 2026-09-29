@@ -25,6 +25,14 @@ pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signat
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
+/// 「只有 thinking、没有正文 / 工具调用」且重试无果时的错误类型。
+///
+/// 用 `overloaded_error` 而不是 `max_tokens`：客户端会把它当成可重试的临时故障，
+/// 而不是「输出预算耗尽」去自动续写（续写会把这条空回合带进历史，越续越糟）。
+pub(super) const THINKING_ONLY_ERROR_TYPE: &str = "overloaded_error";
+pub(super) const THINKING_ONLY_ERROR_MESSAGE: &str =
+    "Upstream ended the response after thinking without any text or tool call";
+
 /// 跨 chunk 过滤字面 `<tool_use ...>...</tool_use>` XML 泄漏（见
 /// [`crate::kiro::model::events::strip_tool_use_xml_leaks`] 的语义）。
 ///
@@ -969,6 +977,11 @@ impl ToolJsonAccumulator {
         }
     }
 
+    /// 是否仍有未收到 `stop=true` 的工具调用分片在缓冲。
+    pub fn has_pending(&self) -> bool {
+        !self.buffers.is_empty()
+    }
+
     /// 累积一个 `toolUseEvent` 分片。
     ///
     /// - 未收到 `stop` 时返回 `Ok(None)`（继续缓冲，不发出任何事件）。
@@ -1154,6 +1167,11 @@ impl SseStateManager {
         self.active_blocks
             .values()
             .any(|b| b.block_type != "thinking")
+    }
+
+    /// 上游是否显式给出过 stop_reason（如 ContentLengthExceeded → max_tokens）
+    fn has_explicit_stop_reason(&self) -> bool {
+        self.stop_reason.is_some()
     }
 
     /// 获取最终的 stop_reason
@@ -1445,6 +1463,11 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 本次流里没有转成客户端内容的上游帧（未知事件 / 解析失败 / error / exception），
+    /// 去重后最多保留 8 个，仅用于「只有 thinking」等异常终态的诊断日志。
+    dropped_frame_kinds: Vec<String>,
+    /// 收尾时判定为「只有 thinking、没有正文 / 工具调用」的异常终态（已发出 error 事件）。
+    thinking_only_error: Option<String>,
 }
 
 impl StreamContext {
@@ -1519,6 +1542,8 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            dropped_frame_kinds: Vec::new(),
+            thinking_only_error: None,
         }
     }
 
@@ -1642,6 +1667,7 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.note_dropped_frame(&format!("error:{}", error_code));
                 Vec::new()
             }
             Event::Exception {
@@ -1653,6 +1679,7 @@ impl StreamContext {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                self.note_dropped_frame(&format!("exception:{}", exception_type));
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2440,8 +2467,11 @@ impl StreamContext {
         events
     }
 
-    /// 生成最终事件序列
-    pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+    /// 把各级缓冲（`<tool_use>` 过滤器 / thinking / invoke 嗅探）的残留全部 flush 成内容块。
+    ///
+    /// 可重复调用：缓冲清空后再调用只返回空。判断 [`Self::is_thinking_only`] 之前必须先调用，
+    /// 否则还压在缓冲里的正文会被误判成「没有正文」。
+    pub fn flush_pending_buffers(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
@@ -2525,23 +2555,104 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
-        }
-
         // Flush invoke 嗅探缓冲区的残留：先再嗅探一次完整块（万一最后一块就是完整 invoke），
         // 剩下的走 emit_text_delta_raw flush 出去（防尾字节丢）。
+        // 必须在 thinking-only 判定之前：嗅探缓冲里的正文 / 捞回的 tool_use 都算非 thinking 内容。
         if !self.invoke_sniff_buffer.is_empty() {
             events.extend(self.drain_invoke_sniff_buffer(true));
         }
 
+        events
+    }
+
+    /// 整条流是否只产出了 thinking：没有 text / tool_use，也没有还在累积的工具调用。
+    ///
+    /// 须在 [`Self::flush_pending_buffers`] 之后调用。
+    fn is_thinking_only(&self) -> bool {
+        self.thinking_enabled
+            && self.thinking_block_index.is_some()
+            && !self.state_manager.has_non_thinking_blocks()
+            && self.tool_json_error.is_none()
+            && !self.tool_json_accumulator.has_pending()
+    }
+
+    /// 「只有 thinking」且上游没有显式给出 stop_reason：实测几乎都是上游中途收尾
+    /// （没有 meteringEvent，credits=0），可以透明重试。
+    ///
+    /// 上游显式给了 stop_reason（ContentLengthExceeded → max_tokens、上下文满）的
+    /// 是真实终态，重试也不会有不同结果，不在此列。须在 [`Self::flush_pending_buffers`] 之后调用。
+    pub fn is_retryable_thinking_only(&self) -> bool {
+        self.is_thinking_only() && !self.state_manager.has_explicit_stop_reason()
+    }
+
+    /// 「只有 thinking」时为透明重试做准备：关闭已发出的 thinking 块并重置本段解析状态，
+    /// 让下一次上游响应的 thinking / 正文作为新的内容块接在后面（块索引继续递增）。
+    ///
+    /// 已累计的 credits / metering / output_tokens 保留，按真实消耗结算。
+    pub fn prepare_thinking_only_retry(&mut self) -> Vec<SseEvent> {
+        let events = self.close_open_thinking_block();
+        self.thinking_block_index = None;
+        self.pending_thinking_signature = None;
+        self.in_thinking_block = false;
+        self.thinking_extracted = false;
+        self.strip_thinking_leading_newline = false;
+        self.thinking_buffer.clear();
+        self.invoke_sniff_buffer.clear();
+        self.text_block_index = None;
+        self.tool_use_xml_filter = ToolUseXmlLeakFilter::default();
+        events
+    }
+
+    /// 记录一个没有转成客户端内容的上游帧类型（去重，最多 8 个）。
+    pub fn note_dropped_frame(&mut self, kind: &str) {
+        if self.dropped_frame_kinds.len() < 8 && !self.dropped_frame_kinds.iter().any(|k| k == kind)
+        {
+            self.dropped_frame_kinds.push(kind.to_string());
+        }
+    }
+
+    /// 以「只有 thinking」异常终态结束：发 `overloaded_error` 事件（不发 message_stop）。
+    ///
+    /// `reason` 只进日志和结算记录，发给客户端的始终是固定文案。
+    pub fn thinking_only_error_events(&mut self, reason: String) -> Vec<SseEvent> {
+        tracing::warn!(
+            metering = self.metering.is_some(),
+            credits = self.credits,
+            output_tokens = self.output_tokens,
+            dropped_frames = ?self.dropped_frame_kinds,
+            "{}",
+            reason
+        );
+        self.thinking_only_error = Some(reason);
+        self.generate_error_events(THINKING_ONLY_ERROR_TYPE, THINKING_ONLY_ERROR_MESSAGE)
+    }
+
+    /// 收尾时判定为「只有 thinking」异常终态的原因（此时已发出 error 事件）。
+    pub fn thinking_only_error(&self) -> Option<&str> {
+        self.thinking_only_error.as_deref()
+    }
+
+    /// 生成最终事件序列
+    pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        let mut events = self.flush_pending_buffers();
+
+        // 整条流只有 thinking、没有正文也没有工具调用：实测几乎都是上游中途收尾
+        // （没有 meteringEvent，credits=0），并不是真的耗尽了 token 预算。
+        // 以前这里伪造 stop_reason=max_tokens 并补一个空格正文，Claude Code 会据此报
+        // 「Output token limit hit」并自动续写，续写又带着这条空回合进历史，连环失败。
+        // 改为异常终态：发 error 事件而非 message_stop，这条空回合不会被当成正常完成写进历史。
+        // （流式路径在走到这里之前会先透明重试，见 handlers::ThinkingOnlyRetry。）
+        if self.is_retryable_thinking_only() {
+            events.extend(self.thinking_only_error_events(
+                "上游只返回了 thinking，没有正文或工具调用".to_string(),
+            ));
+            return events;
+        }
+        // 上游显式给了 stop_reason（max_tokens / 上下文满）但只有 thinking：如实透传原因，
+        // 补一个空格正文，避免下游拿到只有 thinking 的 assistant 消息。
+        if self.is_thinking_only() {
+            events.extend(self.create_text_delta_events(" "));
+        }
         // 收尾检查工具调用累积器：若仍有 tool_use 从未收到 stop=true（上游在参数
         // 写到一半时截断），记为错误。process_tool_use 中已置位的错误保持不变。
         if self.tool_json_error.is_none()
@@ -2718,6 +2829,16 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 「只有 thinking」异常终态的原因（转发内部 StreamContext）。缓冲流据此记 error。
+    pub fn thinking_only_error(&self) -> Option<&str> {
+        self.inner.thinking_only_error()
+    }
+
+    /// 记录没有转成客户端内容的上游帧类型（转发内部 StreamContext）。
+    pub fn note_dropped_frame(&mut self, kind: &str) {
+        self.inner.note_dropped_frame(kind)
     }
 }
 
@@ -4541,8 +4662,9 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
+    fn test_thinking_only_ends_with_overloaded_error() {
+        // 整个流只有 thinking 块、上游也没给 stop_reason（实测为上游中途收尾）：
+        // 不能伪造 max_tokens（Claude Code 会据此自动续写、越续越糟），应以 error 终态结束
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4554,51 +4676,154 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all_events.extend(ctx.flush_pending_buffers());
+        assert!(
+            ctx.is_retryable_thinking_only(),
+            "应判定为可重试的纯 thinking"
+        );
         all_events.extend(ctx.generate_final_events());
 
-        let message_delta = all_events
+        let error = all_events
             .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("should have message_delta event");
-
-        assert_eq!(
-            message_delta.data["delta"]["stop_reason"], "max_tokens",
-            "stop_reason should be max_tokens when only thinking is produced"
+            .find(|e| e.event == "error")
+            .expect("should have error event");
+        assert_eq!(error.data["error"]["type"], "overloaded_error");
+        assert!(ctx.thinking_only_error().is_some());
+        assert!(
+            !all_events
+                .iter()
+                .any(|e| e.event == "message_delta" || e.event == "message_stop"),
+            "异常终态不能再发 message_delta / message_stop"
         );
 
-        // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
+        // 不再补空格正文；thinking 块须先发 signature_delta 再关闭
         assert!(
-            all_events.iter().any(|e| {
+            !all_events.iter().any(|e| {
                 e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
             }),
-            "should emit text content_block_start"
+            "should not emit a padding text block"
         );
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == " "
-            }),
-            "should emit text_delta with a single space"
-        );
-        // text block 应被 generate_final_events 自动关闭
-        let text_block_index = all_events
+        let signature_pos = all_events
             .iter()
-            .find_map(|e| {
-                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                    e.data["index"].as_i64()
-                } else {
-                    None
-                }
+            .position(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
             })
-            .expect("text block should exist");
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(text_block_index)
-            }),
-            "text block should be stopped"
+            .expect("thinking block should get a signature_delta");
+        let stop_pos = all_events
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"] == 0)
+            .expect("thinking block should be stopped");
+        let error_pos = all_events.iter().position(|e| e.event == "error").unwrap();
+        assert!(signature_pos < stop_pos && stop_pos < error_pos);
+    }
+
+    #[test]
+    fn test_thinking_only_keeps_explicit_max_tokens() {
+        // 上游显式报 ContentLengthExceeded：是真实终态，如实透传 max_tokens，不当成异常
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
         );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        }));
+        all.extend(ctx.flush_pending_buffers());
+        assert!(!ctx.is_retryable_thinking_only());
+        all.extend(ctx.generate_final_events());
+
+        assert!(!all.iter().any(|e| e.event == "error"));
+        let delta = all.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(collect_text_content(&all), " ");
+    }
+
+    #[test]
+    fn test_thinking_then_buffered_invoke_is_not_thinking_only() {
+        // 回归：invoke 嗅探缓冲必须在「只有 thinking」判定之前 drain，
+        // 否则 thinking + 工具调用会被误判成纯 thinking
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<thinking>\nabc</thinking>\n\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        assert!(
+            !all.iter().any(|e| e.event == "error"),
+            "不应报错: {:?}",
+            all
+        );
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+        let delta = all.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_thinking_only_retry_appends_new_blocks() {
+        // 透明重试：第一段只有 thinking，第二段 thinking + 正文，块索引接着递增
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all.extend(ctx.flush_pending_buffers());
+        assert!(ctx.is_retryable_thinking_only());
+        all.extend(ctx.prepare_thinking_only_retry());
+        all.extend(ctx.process_assistant_response("<thinking>\ndef</thinking>\n\nHello"));
+        all.extend(ctx.generate_final_events());
+
+        assert!(
+            !all.iter().any(|e| e.event == "error"),
+            "不应报错: {:?}",
+            all
+        );
+        let starts: Vec<(String, i64)> = all
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| {
+                let kind = e.data["content_block"]["type"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                (kind, e.data["index"].as_i64().unwrap())
+            })
+            .collect();
+        let expected = vec![
+            ("thinking".to_string(), 0),
+            ("thinking".to_string(), 1),
+            ("text".to_string(), 2),
+        ];
+        assert_eq!(starts, expected);
+        let stops = all
+            .iter()
+            .filter(|e| e.event == "content_block_stop" && e.data["index"] == 0);
+        assert_eq!(stops.count(), 1, "第一段 thinking 块只关闭一次");
+        assert_eq!(collect_text_content(&all), "Hello");
+        let delta = all.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "end_turn");
     }
 
     #[test]

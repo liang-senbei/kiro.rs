@@ -970,6 +970,28 @@ async fn handle_stream_request(
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
+    // 只有 thinking、没有正文时透明重试（只在启用 thinking 时才可能出现这种终态）
+    let retry = if thinking_enabled {
+        let request_body: std::sync::Arc<str> = request_body.into();
+        let tracer = tracer.clone();
+        Some(ThinkingOnlyRetry::new(
+            THINKING_ONLY_MAX_RETRIES,
+            move || {
+                let provider = provider.clone();
+                let request_body = request_body.clone();
+                let tracer = tracer.clone();
+                let group = group.clone();
+                async move {
+                    provider
+                        .call_api_stream(&request_body, Some(tracer.as_ref()), group.as_deref())
+                        .await
+                }
+            },
+        ))
+    } else {
+        None
+    };
+
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
         model,
@@ -984,7 +1006,15 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        hook,
+        credential_id,
+        tracer,
+        retry,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -999,6 +1029,78 @@ async fn handle_stream_request(
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
+/// 「只有 thinking、没有正文 / 工具调用」时在同一条 SSE 流内透明重试的最大次数
+const THINKING_ONLY_MAX_RETRIES: u32 = 2;
+
+type RetryCallFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = anyhow::Result<crate::kiro::provider::KiroCallResult>>
+            + Send,
+    >,
+>;
+
+/// 「只有 thinking」终态的透明重试器。
+///
+/// 实测这种终态几乎都是上游中途收尾（没有 meteringEvent，credits=0），同样的请求
+/// 重发一次通常就能拿到正文。已发出的 thinking 块照常关闭，新响应的内容块接在后面，
+/// 客户端看到的仍是一条完整的消息；重试用尽才以 `overloaded_error` 结束。
+struct ThinkingOnlyRetry {
+    /// 剩余可重试次数
+    remaining: u32,
+    /// 已发起的重试次数
+    attempts: u32,
+    /// 重新发起同一个上游请求
+    start: Box<dyn FnMut() -> RetryCallFuture + Send>,
+    /// 进行中的重试请求（等待期间照常发 ping）
+    in_flight: Option<RetryCallFuture>,
+}
+
+impl ThinkingOnlyRetry {
+    fn new<F, Fut>(max_retries: u32, mut start: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<crate::kiro::provider::KiroCallResult>>
+            + Send
+            + 'static,
+    {
+        Self {
+            remaining: max_retries,
+            attempts: 0,
+            start: Box::new(move || Box::pin(start()) as RetryCallFuture),
+            in_flight: None,
+        }
+    }
+}
+
+/// SSE 事件转成响应体字节块
+fn sse_bytes(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>> {
+    events
+        .into_iter()
+        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+        .collect()
+}
+
+/// 解析一个上游帧。没有转成 [`Event`] 的帧（未知事件类型 / 解析失败）返回其类型，
+/// 由调用方记进诊断信息——以前这类帧被静默丢弃，出问题时日志里什么都看不到。
+fn decode_kiro_frame(frame: crate::kiro::parser::frame::Frame) -> Result<Event, String> {
+    let kind = format!(
+        "{}:{}",
+        frame.message_type().unwrap_or("event"),
+        frame.event_type().unwrap_or("unknown")
+    );
+    match Event::from_frame(frame) {
+        Ok(Event::Unknown {}) => {
+            tracing::debug!(kind = %kind, "忽略未知的上游事件");
+            Err(kind)
+        }
+        Ok(event) => Ok(event),
+        Err(e) => {
+            tracing::warn!(kind = %kind, "解析上游事件失败: {}", e);
+            Err(kind)
+        }
+    }
+}
+
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
@@ -1012,6 +1114,7 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    retry: Option<ThinkingOnlyRetry>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1025,10 +1128,45 @@ fn create_sse_stream(
     let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64, retry),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes, mut retry)| async move {
             if finished {
                 return None;
+            }
+
+            // 「只有 thinking」透明重试进行中：等新的上游响应，期间照常发 ping 保活
+            if let Some(mut call) = retry.as_mut().and_then(|r| r.in_flight.take()) {
+                tokio::select! {
+                    result = &mut call => {
+                        match result {
+                            Ok(call_result) => {
+                                body_stream = call_result.response.bytes_stream();
+                                decoder = EventStreamDecoder::new();
+                                settlement.credential_id = call_result.credential_id;
+                                return Some((stream::iter(Vec::new()), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
+                            }
+                            Err(e) => {
+                                let reason = format!("只有 thinking，透明重试请求失败: {}", e);
+                                let final_events = ctx.thinking_only_error_events(reason.clone());
+                                settlement.update(&ctx, sent_bytes);
+                                settlement.finish(
+                                    "error",
+                                    "interrupted",
+                                    Some(outcome::STREAM_INTERRUPTED),
+                                    Some(&reason),
+                                    Some(sent_bytes),
+                                );
+                                return Some((stream::iter(sse_bytes(final_events)), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)));
+                            }
+                        }
+                    }
+                    _ = ping_interval.tick() => {
+                        if let Some(r) = retry.as_mut() {
+                            r.in_flight = Some(call);
+                        }
+                        return Some((stream::iter(vec![Ok(create_ping_sse())]), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
+                    }
+                }
             }
 
             // 使用 select! 同时等待数据和 ping 定时器
@@ -1047,12 +1185,13 @@ fn create_sse_stream(
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
+                                    Ok(frame) => match decode_kiro_frame(frame) {
+                                        Ok(event) => {
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
-                                    }
+                                        Err(kind) => ctx.note_dropped_frame(&kind),
+                                    },
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
                                     }
@@ -1066,7 +1205,7 @@ fn create_sse_stream(
                                 .collect();
                             settlement.update(&ctx, sent_bytes);
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1089,12 +1228,33 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
                         }
                         None => {
+                            // 只有 thinking、没有正文：还有重试次数就在同一条流里透明重试
+                            let mut events = ctx.flush_pending_buffers();
+                            if ctx.is_retryable_thinking_only()
+                                && let Some(r) = retry.as_mut().filter(|r| r.remaining > 0)
+                            {
+                                r.remaining -= 1;
+                                r.attempts += 1;
+                                tracing::warn!(
+                                    attempt = r.attempts,
+                                    credits = ctx.credits,
+                                    output_tokens = ctx.output_tokens,
+                                    "上游只返回了 thinking，没有正文或工具调用，透明重试"
+                                );
+                                events.extend(ctx.prepare_thinking_only_retry());
+                                r.in_flight = Some((r.start)());
+                                settlement.update(&ctx, sent_bytes);
+                                return Some((stream::iter(sse_bytes(events)), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
+                            }
+                            let retried = retry.as_ref().map_or(0, |r| r.attempts);
+
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
-                            let final_events = ctx.generate_final_events();
+                            events.extend(ctx.generate_final_events());
+                            let final_events = events;
                             settlement.update(&ctx, sent_bytes);
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
@@ -1106,14 +1266,27 @@ fn create_sse_stream(
                                     Some(&message),
                                     None,
                                 );
+                            } else if let Some(reason) = ctx.thinking_only_error() {
+                                // 重试用尽仍只有 thinking：按上游中途收尾记 interrupted
+                                let message = format!("{}（透明重试 {} 次）", reason, retried);
+                                settlement.finish(
+                                    "error",
+                                    "interrupted",
+                                    Some(outcome::STREAM_INTERRUPTED),
+                                    Some(&message),
+                                    Some(sent_bytes),
+                                );
                             } else {
+                                if retried > 0 {
+                                    tracing::info!(retried, "透明重试后拿到了正文");
+                                }
                                 settlement.finish("success", "success", None, None, None);
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
                         }
                     }
                 }
@@ -1121,7 +1294,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)))
                 }
             }
         },
@@ -2101,12 +2274,11 @@ fn create_buffered_sse_stream(
 
                                 for result in decoder.decode_iter() {
                                     match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
-                                            }
-                                        }
+                                        Ok(frame) => match decode_kiro_frame(frame) {
+                                            // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                            Ok(event) => ctx.process_and_buffer(&event),
+                                            Err(kind) => ctx.note_dropped_frame(&kind),
+                                        },
                                         Err(e) => {
                                             tracing::warn!("解码事件失败: {}", e);
                                         }
@@ -2162,6 +2334,16 @@ fn create_buffered_sse_stream(
                                         Some(outcome::BAD_REQUEST),
                                         Some(&message),
                                         None,
+                                        trace_usage,
+                                    );
+                                } else if let Some(reason) = ctx.thinking_only_error() {
+                                    // 只有 thinking、没有正文：上游中途收尾，error 事件已随缓冲发出
+                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    tracer.finalize(
+                                        "interrupted",
+                                        Some(outcome::STREAM_INTERRUPTED),
+                                        Some(reason),
+                                        Some(sent_bytes),
                                         trace_usage,
                                     );
                                 } else {
@@ -2705,5 +2887,231 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+
+    // ---- 「只有 thinking」透明重试：手工构造上游 event-stream 帧 ----
+
+    /// 按 AWS event-stream 格式编码一个 assistantResponseEvent 帧
+    fn assistant_frame(content: &str) -> Vec<u8> {
+        let mut headers = Vec::new();
+        for (name, value) in [
+            (":message-type", "event"),
+            (":event-type", "assistantResponseEvent"),
+        ] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7); // String
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+        let payload = serde_json::to_vec(&json!({ "content": content })).unwrap();
+        let total_len = (12 + headers.len() + payload.len() + 4) as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(&payload);
+        let message_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    /// 模拟一次上游流式响应：依次下发给定的 assistant 文本分片
+    fn upstream_call(chunks: &[&str]) -> crate::kiro::provider::KiroCallResult {
+        let body: Vec<u8> = chunks.iter().flat_map(|c| assistant_frame(c)).collect();
+        crate::kiro::provider::KiroCallResult {
+            response: reqwest::Response::from(http::Response::new(body)),
+            credential_id: 42,
+        }
+    }
+
+    /// 收集 SSE 流，解析成 (event, data)，过滤掉 ping
+    async fn collect_sse(
+        stream: impl Stream<Item = Result<Bytes, Infallible>>,
+    ) -> Vec<(String, serde_json::Value)> {
+        let chunks: Vec<Result<Bytes, Infallible>> = stream.collect().await;
+        let text: String = chunks
+            .into_iter()
+            .map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap())
+            .collect();
+        text.split("\n\n")
+            .filter(|block| !block.trim().is_empty())
+            .filter_map(|block| {
+                let event = block.lines().find_map(|l| l.strip_prefix("event: "))?;
+                let data = block.lines().find_map(|l| l.strip_prefix("data: "))?;
+                Some((event.to_string(), serde_json::from_str(data).unwrap()))
+            })
+            .filter(|(event, _)| event != "ping")
+            .collect()
+    }
+
+    /// 以启用 thinking 的上下文跑完整条 SSE 流；返回事件、重试调用次数、用量聚合器
+    async fn run_thinking_stream(
+        first: crate::kiro::provider::KiroCallResult,
+        mut retries: Vec<anyhow::Result<crate::kiro::provider::KiroCallResult>>,
+    ) -> (
+        Vec<(String, serde_json::Value)>,
+        usize,
+        std::sync::Arc<crate::admin::usage_stats::UsageAggregator>,
+    ) {
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
+            None,
+            None,
+            Some(aggregator.clone()),
+        );
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 0,
+                    group: None,
+                    key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
+                },
+                model: "test-model".to_string(),
+                is_stream: true,
+            },
+        ));
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            11,
+            true,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let initial_events = ctx.generate_initial_events();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        retries.reverse();
+        let retry = ThinkingOnlyRetry::new(THINKING_ONLY_MAX_RETRIES, move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = retries.pop().expect("重试次数超出预期");
+            async move { next }
+        });
+
+        let stream = create_sse_stream(
+            first.response,
+            ctx,
+            initial_events,
+            hook,
+            first.credential_id,
+            tracer,
+            Some(retry),
+        );
+        let events = collect_sse(stream).await;
+        let calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+        (events, calls, aggregator)
+    }
+
+    fn block_starts(events: &[(String, serde_json::Value)]) -> Vec<(String, i64)> {
+        events
+            .iter()
+            .filter(|(event, _)| event == "content_block_start")
+            .map(|(_, data)| {
+                let kind = data["content_block"]["type"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                (kind, data["index"].as_i64().unwrap())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn thinking_only_stream_is_retried_transparently() {
+        let (events, calls, aggregator) = run_thinking_stream(
+            upstream_call(&["<thinking>\nabc</thinking>"]),
+            vec![Ok(upstream_call(&[
+                "<thinking>\ndef</thinking>\n\n",
+                "Hello",
+            ]))],
+        )
+        .await;
+
+        assert_eq!(calls, 1, "只应重试一次");
+        assert!(
+            !events.iter().any(|(e, _)| e == "error"),
+            "不应报错: {:?}",
+            events
+        );
+        let expected = vec![
+            ("thinking".to_string(), 0),
+            ("thinking".to_string(), 1),
+            ("text".to_string(), 2),
+        ];
+        assert_eq!(block_starts(&events), expected);
+        let (_, delta) = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events.last().unwrap().0, "message_stop");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn thinking_only_stream_ends_with_overloaded_error_after_retries() {
+        let only_thinking = || upstream_call(&["<thinking>\nabc</thinking>"]);
+        let (events, calls, aggregator) = run_thinking_stream(
+            only_thinking(),
+            vec![Ok(only_thinking()), Ok(only_thinking())],
+        )
+        .await;
+
+        assert_eq!(calls, THINKING_ONLY_MAX_RETRIES as usize);
+        let (last_event, last_data) = events.last().unwrap();
+        assert_eq!(last_event, "error");
+        assert_eq!(last_data["error"]["type"], "overloaded_error");
+        assert!(
+            !events
+                .iter()
+                .any(|(e, _)| e == "message_delta" || e == "message_stop")
+        );
+        assert_eq!(block_starts(&events).len(), 3, "三段 thinking 各一个块");
+        let stops = events
+            .iter()
+            .filter(|(e, _)| e == "content_block_stop")
+            .count();
+        assert_eq!(stops, 3, "每个 thinking 块都要关闭");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn thinking_only_retry_request_failure_ends_with_overloaded_error() {
+        let (events, calls, aggregator) = run_thinking_stream(
+            upstream_call(&["<thinking>\nabc</thinking>"]),
+            vec![Err(anyhow::anyhow!("all credentials exhausted"))],
+        )
+        .await;
+
+        assert_eq!(calls, 1);
+        let (last_event, last_data) = events.last().unwrap();
+        assert_eq!(last_event, "error");
+        assert_eq!(last_data["error"]["type"], "overloaded_error");
+        assert!(
+            !last_data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("credentials"),
+            "上游错误细节不应透传给客户端"
+        );
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn text_stream_is_not_retried() {
+        let (events, calls, _) = run_thinking_stream(
+            upstream_call(&["<thinking>\nabc</thinking>\n\nHello"]),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(calls, 0);
+        assert_eq!(events.last().unwrap().0, "message_stop");
     }
 }
