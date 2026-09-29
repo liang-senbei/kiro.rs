@@ -561,14 +561,15 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
+///
+/// 使用 CSPRNG（`rand::rng()`，ChaCha 且由 OS 熵源播种），Key 不可被预测。
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let body: String = (0..32)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
+    use rand::Rng;
+    use rand::distr::Alphanumeric;
+    let body: String = rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(32)
+        .map(char::from)
         .collect();
     format!("sk-{}", body)
 }
@@ -674,6 +675,15 @@ mod tests {
         assert_eq!(mask_client_key("sk-abcdefghijklmnop"), "sk-abcde...mnop");
         assert_eq!(mask_client_key("short"), "short");
         assert_eq!(mask_client_key("密钥🔐测试abcdefgh"), "密钥🔐测试abc...efgh");
+    }
+
+    #[test]
+    fn generated_key_is_sk_prefixed_base62() {
+        let key = generate_client_key();
+        let body = key.strip_prefix("sk-").expect("应以 sk- 开头");
+        assert_eq!(body.len(), 32);
+        assert!(body.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(generate_client_key(), key);
     }
 
     #[test]

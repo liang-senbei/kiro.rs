@@ -252,16 +252,10 @@ fn base64_encode_standard(data: &[u8]) -> String {
 
 /// 生成 PKCE code_verifier 和 code_challenge
 pub fn generate_pkce() -> (String, String) {
-    // 32 字节随机数作为 verifier（与 IDE crypto.randomBytes(32).toString("base64url") 等价）
+    use rand::Rng;
+    // 32 字节 CSPRNG 随机数作为 verifier（与 IDE crypto.randomBytes(32).toString("base64url") 等价）
     let mut bytes = [0u8; 32];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = fastrand::u8(..).wrapping_add(i as u8);
-    }
-    // 使用 uuid v4 的随机性来增强
-    let uuid_bytes = uuid::Uuid::new_v4().as_bytes().to_owned();
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b ^= uuid_bytes[i % 16];
-    }
+    rand::rng().fill(&mut bytes);
 
     let verifier = base64url_encode(&bytes);
 
@@ -346,4 +340,24 @@ pub async fn exchange_code_for_token(
     resp.json::<SocialCreateTokenResponse>()
         .await
         .map_err(|e| anyhow::anyhow!("解析 Social token 响应失败: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_pkce_produces_valid_s256_pair() {
+        let (verifier, challenge) = generate_pkce();
+        // 32 字节 base64url 无填充 = 43 字符（RFC 7636 要求 43~128）
+        assert_eq!(verifier.len(), 43);
+        assert!(
+            verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+        let expected = base64url_encode(&Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, expected);
+        assert_ne!(generate_pkce().0, verifier);
+    }
 }

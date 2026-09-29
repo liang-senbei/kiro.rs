@@ -466,13 +466,13 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
     }
 }
 
-/// 生成一段长度为 `len` 的字母数字随机字符串，用于默认 API Key
+/// 生成一段长度为 `len` 的字母数字随机字符串，用于默认 API Key（CSPRNG，不可预测）
 fn random_token(len: usize) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    (0..len)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
+    use rand::Rng;
+    use rand::distr::Alphanumeric;
+    rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(len)
+        .map(char::from)
         .collect()
 }

@@ -27,6 +27,7 @@ futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v1", "v4", "v5", "fast-rng"] }
 fastrand = "2"
+rand = "0.9"          # CSPRNG：生成 API Key / PKCE verifier 等安全敏感随机值
 sha2 = "0.10"
 hex = "0.4"
 crc = "3"           # CRC32C 计算

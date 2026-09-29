@@ -1123,6 +1123,7 @@ dependencies = [
  "image",
  "mime_guess",
  "parking_lot",
+ "rand",
  "redis",
  "reqwest",
  "rusqlite",
