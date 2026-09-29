@@ -630,11 +630,9 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     // 回退到字符串格式: 查找 "session_" 后面的内容
     if let Some(pos) = user_id.find("session_") {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
+        // user_id 由客户端提供，第 36 字节可能落在多字节字符中间，用 get 而非切片避免 panic
+        if let Some(uuid_str) = session_part.get(..36).filter(|s| is_valid_uuid(s)) {
+            return Some(uuid_str.to_string());
         }
     }
     None
@@ -3191,6 +3189,20 @@ mod tests {
         let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd";
         let session_id = extract_session_id(user_id);
         assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_multibyte_no_panic() {
+        // 第 36 字节落在多字节字符中间：应返回 None 而不是 panic
+        let user_id = format!("user_x_session_{}中", "a".repeat(35));
+        assert_eq!(extract_session_id(&user_id), None);
+
+        // UUID 之后紧跟多字节字符：仍能正常提取
+        let user_id = "user_x_session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552中文";
+        assert_eq!(
+            extract_session_id(user_id),
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string())
+        );
     }
 
     #[test]
