@@ -4,7 +4,7 @@
 
 > 本仓库 fork 自 [ZyphrZero/kiro.rs](https://github.com/ZyphrZero/kiro.rs)。原作者为 [hank9999](https://github.com/hank9999)，上游当前由 [ZyphrZero](https://github.com/ZyphrZero) 维护；完整提交历史与作者信息均已保留，并继续以 MIT 协议分发。
 
-Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
+上游 Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 
 `kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 与 OpenAI Chat Completions / Responses API 兼容代理。它把 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 等请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
 
@@ -62,18 +62,18 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停、轮换、分组和统计；鉴权不强制 Key 前缀。
 - **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
 - 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配。
-- **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
-- **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 Docker Hub 多架构镜像。
+- **在线更新**：从本仓库的 GitHub Release 拉取新版本，支持镜像定时自动更新与手动回退。
+- **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 GHCR 多架构镜像。
 
 <a id="quick-start"></a>
 ## 🚀 快速开始
 
 ### Docker
 
-推荐生产部署使用 Docker。仓库提供的 `docker-compose.yml` 默认使用 Docker Hub 镜像：
+推荐生产部署使用 Docker。仓库提供的 `docker-compose.yml` 默认使用本仓库发布到 GHCR 的镜像：
 
 ```yaml
-image: ${KIRO_RS_IMAGE:-zyphrzero/kiro-rs:latest}
+image: ${KIRO_RS_IMAGE:-ghcr.io/liang-senbei/kiro-rs:latest}
 ports:
   - "8990:8990"
 volumes:
@@ -85,7 +85,7 @@ volumes:
 ```bash
 mkdir -p /opt/kiro-rs/data
 cd /opt/kiro-rs
-curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
+curl -O https://raw.githubusercontent.com/liang-senbei/kiro.rs/master/docker-compose.yml
 docker compose up -d
 ```
 
@@ -122,15 +122,15 @@ docker compose logs --tail=200 kiro-rs
 - API: `http://<host>:8990/v1/messages`
 - Admin UI: `http://<host>:8990/admin`
 
-指定镜像版本：
+指定镜像版本（`X.Y.Z` 换成 Release 中的版本号）：
 
 ```bash
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.3 docker compose up -d
+KIRO_RS_IMAGE=ghcr.io/liang-senbei/kiro-rs:X.Y.Z docker compose up -d
 ```
 
 ### 下载二进制
 
-正式版本会在 [GitHub Release](https://github.com/ZyphrZero/kiro.rs/releases/latest) 中发布以下平台产物：
+正式版本会在 [GitHub Release](https://github.com/liang-senbei/kiro.rs/releases/latest) 中发布以下平台产物：
 
 - Windows x64
 - Linux x64 / arm64
@@ -799,16 +799,16 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 校验 `Cargo.toml` 版本和 tag 一致。
 - 构建 Admin UI。
 - 构建多平台二进制。
-- 构建并推送 Docker Hub 多架构镜像。
+- 构建并推送 GHCR 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.3)。
+发布记录见 [Releases](https://github.com/liang-senbei/kiro.rs/releases)；程序内的检查更新和在线更新也从这里获取版本。
 
 Docker 镜像：
 
-- `zyphrzero/kiro-rs:<version>`
-- `zyphrzero/kiro-rs:latest`
-- `zyphrzero/kiro-rs:beta`（master beta 构建）
+- `ghcr.io/liang-senbei/kiro-rs:<version>`
+- `ghcr.io/liang-senbei/kiro-rs:latest`
+- `ghcr.io/liang-senbei/kiro-rs:beta`（master beta 构建）
 
 容器内在线更新会下载对应平台二进制并替换当前可执行文件；替换后进程退出，由 Docker `restart: unless-stopped` 拉起新进程。回退依赖本地 `<exe>.backup`。
 

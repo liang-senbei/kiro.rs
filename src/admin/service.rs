@@ -138,7 +138,7 @@ fn credential_metadata_details(
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
-/// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
+/// GitHub API 对匿名访问按 IP 限流（60 次/小时），30 分钟 TTL 既能让用户
 /// 看到红点提醒，又能避免短时间内重复请求被限流。
 const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
@@ -622,10 +622,6 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
         "Free"
     }
 }
-
-/// GitHub Release 仓库名（owner/repo）。
-/// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
 
 impl AdminService {
     pub fn new(
@@ -2114,7 +2110,7 @@ impl AdminService {
     async fn fetch_latest_release(&self) -> Result<UpdateCheckInfo, AdminServiceError> {
         let url = format!(
             "https://api.github.com/repos/{}/releases/latest",
-            GITHUB_RELEASES_REPO
+            super::binary_update::GITHUB_REPO
         );
         let token = self.update_config.lock().github_token.clone();
         let mut req = reqwest::Client::new()

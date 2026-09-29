@@ -22,8 +22,9 @@ use crate::admin::error::AdminServiceError;
 /// kiro-rs musl 二进制实测 < 50 MB，留 200 MB 上限足够覆盖未来增长。
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
-/// GitHub Releases 仓库 owner/repo。
-const GITHUB_REPO: &str = "ZyphrZero/kiro.rs";
+/// GitHub Releases 仓库 owner/repo，检查更新与下载二进制共用。
+/// 指向本 fork 自己的 Releases：上游发布的版本不含本 fork 的修复。
+pub(super) const GITHUB_REPO: &str = "liang-senbei/kiro.rs";
 
 /// release 包内（解压后）二进制文件名。Linux/macOS 是 `kiro-rs`，
 /// Windows 是 `kiro-rs.exe`。
