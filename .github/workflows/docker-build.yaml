@@ -1,4 +1,4 @@
-name: Build and Push Docker Hub Images
+name: Build and Push GHCR Images
 
 on:
   push:
@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   pre-check:
@@ -63,14 +64,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve Docker Hub repo
+      - name: Resolve GHCR image
         id: repo
         env:
-          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
-          NAMESPACE="${DOCKERHUB_NAMESPACE:-$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')}"
-          echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
+          OWNER="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${OWNER}/kiro-rs" >> "$GITHUB_OUTPUT"
 
       - name: Determine version
         id: version
@@ -88,12 +88,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -116,12 +116,11 @@ jobs:
       - name: Resolve image and version
         id: meta
         env:
-          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          NAMESPACE="${DOCKERHUB_NAMESPACE:-$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')}"
-          echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
+          OWNER="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${OWNER}/kiro-rs" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             RAW_VERSION="${{ github.event.inputs.version }}"
             echo "version=${RAW_VERSION#v}" >> "$GITHUB_OUTPUT"
@@ -132,12 +131,12 @@ jobs:
             echo "is_beta=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest
         env:
