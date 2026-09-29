@@ -25,13 +25,13 @@ pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signat
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
-/// 「只有 thinking、没有正文 / 工具调用」且重试无果时的错误类型。
+/// 上游中途收尾（只有 thinking / 工具调用后没有 meteringEvent）且重试无果时的错误类型。
 ///
 /// 用 `overloaded_error` 而不是 `max_tokens`：客户端会把它当成可重试的临时故障，
 /// 而不是「输出预算耗尽」去自动续写（续写会把这条空回合带进历史，越续越糟）。
-pub(super) const THINKING_ONLY_ERROR_TYPE: &str = "overloaded_error";
-pub(super) const THINKING_ONLY_ERROR_MESSAGE: &str =
-    "Upstream ended the response after thinking without any text or tool call";
+pub(super) const TRUNCATION_ERROR_TYPE: &str = "overloaded_error";
+pub(super) const TRUNCATION_ERROR_MESSAGE: &str =
+    "Upstream ended the response prematurely (no text, or tool call possibly truncated)";
 
 /// 跨 chunk 过滤字面 `<tool_use ...>...</tool_use>` XML 泄漏（见
 /// [`crate::kiro::model::events::strip_tool_use_xml_leaks`] 的语义）。
@@ -1466,8 +1466,21 @@ pub struct StreamContext {
     /// 本次流里没有转成客户端内容的上游帧（未知事件 / 解析失败 / error / exception），
     /// 去重后最多保留 8 个，仅用于「只有 thinking」等异常终态的诊断日志。
     dropped_frame_kinds: Vec<String>,
-    /// 收尾时判定为「只有 thinking、没有正文 / 工具调用」的异常终态（已发出 error 事件）。
-    thinking_only_error: Option<String>,
+    /// 收尾时判定为上游中途收尾的异常终态原因（已发出 error 事件）。
+    truncation_error: Option<String>,
+    /// 已解析完、但还没发给客户端的工具调用。
+    ///
+    /// 上游中途收尾时会把写到一半的工具参数闭合成合法 JSON、照样带 stop=true 下发
+    /// （实测是半截 Bash 命令），单看 JSON 无法区分；唯一可靠的信号是这次响应有没有
+    /// meteringEvent。所以工具调用先扣在这里，等 meteringEvent 到达（或后面还有内容）
+    /// 再按原顺序发出；流结束仍没有 meteringEvent 就按截断处理（透明重试 / 报错），
+    /// 不把可能半截的命令交给客户端执行。
+    held_tool_uses: Vec<CompletedToolUse>,
+    /// 当前这次上游响应（透明重试时每次重置）是否收到过 meteringEvent。
+    ///
+    /// `metering` 跨重试保留用于结算；扣住工具调用 / 判定截断只能看本次响应自己的信号，
+    /// 否则上一次「只有 thinking 但有 meteringEvent」的响应会让重试里的半截工具调用漏判。
+    attempt_metered: bool,
 }
 
 impl StreamContext {
@@ -1543,7 +1556,9 @@ impl StreamContext {
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             dropped_frame_kinds: Vec::new(),
-            thinking_only_error: None,
+            truncation_error: None,
+            held_tool_uses: Vec::new(),
+            attempt_metered: false,
         }
     }
 
@@ -1611,9 +1626,23 @@ impl StreamContext {
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
-            Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::AssistantResponse(resp) => {
+                // 工具调用之后还有实质内容：上游显然没在工具调用处收尾，
+                // 先按原顺序发出扣住的工具调用（纯空白不算，可能只是收尾的换行）。
+                let mut events = if resp.content.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    self.release_held_tool_uses()
+                };
+                events.extend(self.process_assistant_response(&resp.content));
+                events
+            }
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
-            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::ReasoningContent(reasoning) => {
+                let mut events = self.release_held_tool_uses();
+                events.extend(self.process_reasoning_content(reasoning));
+                events
+            }
             Event::Metadata(metadata) => {
                 if let Some(usage) = metadata.token_usage {
                     let usage = usage.sanitized();
@@ -1660,7 +1689,9 @@ impl StreamContext {
                 // 保留最近一次完整 payload，用于在 message_delta 里透传 credit_*
                 // 字段；如果上游真的多次下发，则以最后一次为准（与 kiro-rs 一致）。
                 self.metering = Some(metering.clone());
-                Vec::new()
+                // 有 meteringEvent 说明上游正常结束了这次生成，扣住的工具调用可以放行。
+                self.attempt_metered = true;
+                self.release_held_tool_uses()
             }
             Event::Error {
                 error_code,
@@ -2463,7 +2494,21 @@ impl StreamContext {
         };
 
         // 统一发出（与 <invoke> 文本捞回路径共用同一发出口）。
+        // 还没收到 meteringEvent 时先扣住，见 `held_tool_uses` 的说明。
+        if !self.attempt_metered {
+            self.held_tool_uses.push(completed);
+            return events;
+        }
         events.extend(self.emit_completed_tool_use(completed));
+        events
+    }
+
+    /// 按到达顺序发出扣住的工具调用。
+    fn release_held_tool_uses(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        for completed in std::mem::take(&mut self.held_tool_uses) {
+            events.extend(self.emit_completed_tool_use(completed));
+        }
         events
     }
 
@@ -2565,7 +2610,7 @@ impl StreamContext {
         events
     }
 
-    /// 整条流是否只产出了 thinking：没有 text / tool_use，也没有还在累积的工具调用。
+    /// 整条流是否只产出了 thinking：没有 text / tool_use，也没有还在累积或扣住的工具调用。
     ///
     /// 须在 [`Self::flush_pending_buffers`] 之后调用。
     fn is_thinking_only(&self) -> bool {
@@ -2574,23 +2619,48 @@ impl StreamContext {
             && !self.state_manager.has_non_thinking_blocks()
             && self.tool_json_error.is_none()
             && !self.tool_json_accumulator.has_pending()
+            && self.held_tool_uses.is_empty()
     }
 
-    /// 「只有 thinking」且上游没有显式给出 stop_reason：实测几乎都是上游中途收尾
-    /// （没有 meteringEvent，credits=0），可以透明重试。
+    /// 上游中途收尾的判定，返回原因（只进日志和结算记录）；不是则返回 `None`。
+    ///
+    /// 两种情况，实测都是上游没下发 meteringEvent（credits=0）：
+    /// - 只有 thinking，没有正文 / 工具调用；
+    /// - 有工具调用但没有 meteringEvent：参数可能是被截断后闭合的半截 JSON。
     ///
     /// 上游显式给了 stop_reason（ContentLengthExceeded → max_tokens、上下文满）的
     /// 是真实终态，重试也不会有不同结果，不在此列。须在 [`Self::flush_pending_buffers`] 之后调用。
-    pub fn is_retryable_thinking_only(&self) -> bool {
-        self.is_thinking_only() && !self.state_manager.has_explicit_stop_reason()
+    pub fn truncation_reason(&self) -> Option<&'static str> {
+        if self.state_manager.has_explicit_stop_reason() {
+            return None;
+        }
+        if self.is_thinking_only() {
+            return Some("上游只返回了 thinking，没有正文或工具调用");
+        }
+        if !self.held_tool_uses.is_empty() && !self.attempt_metered {
+            return Some("上游在工具调用后收尾且没有 meteringEvent，工具参数可能被截断");
+        }
+        None
     }
 
-    /// 「只有 thinking」时为透明重试做准备：关闭已发出的 thinking 块并重置本段解析状态，
-    /// 让下一次上游响应的 thinking / 正文作为新的内容块接在后面（块索引继续递增）。
+    /// 上游中途收尾、且可以在同一条流里透明重试。
+    ///
+    /// 已经发给客户端的工具调用无法撤回，重试会让它执行两遍，所以这种情况不重试。
+    pub fn is_retryable_truncation(&self) -> bool {
+        self.truncation_reason().is_some() && self.tool_block_indices.is_empty()
+    }
+
+    /// 为透明重试做准备：关闭已发出的 thinking / 正文块、丢弃扣住的工具调用并重置本段解析状态，
+    /// 让下一次上游响应的内容作为新的内容块接在后面（块索引继续递增）。
     ///
     /// 已累计的 credits / metering / output_tokens 保留，按真实消耗结算。
-    pub fn prepare_thinking_only_retry(&mut self) -> Vec<SseEvent> {
-        let events = self.close_open_thinking_block();
+    pub fn prepare_truncation_retry(&mut self) -> Vec<SseEvent> {
+        let mut events = self.close_open_thinking_block();
+        if let Some(idx) = self.text_block_index.take()
+            && let Some(stop) = self.state_manager.handle_content_block_stop(idx)
+        {
+            events.push(stop);
+        }
         self.thinking_block_index = None;
         self.pending_thinking_signature = None;
         self.in_thinking_block = false;
@@ -2598,8 +2668,14 @@ impl StreamContext {
         self.strip_thinking_leading_newline = false;
         self.thinking_buffer.clear();
         self.invoke_sniff_buffer.clear();
-        self.text_block_index = None;
+        self.code_fence_open = false;
+        self.fence_scan_partial.clear();
         self.tool_use_xml_filter = ToolUseXmlLeakFilter::default();
+        self.tool_json_accumulator = ToolJsonAccumulator::new();
+        self.held_tool_uses.clear();
+        self.attempt_metered = false;
+        // 只在没有发出过工具调用时才会重试（见 is_retryable_truncation），可以放心复位。
+        self.state_manager.set_has_tool_use(false);
         events
     }
 
@@ -2611,43 +2687,47 @@ impl StreamContext {
         }
     }
 
-    /// 以「只有 thinking」异常终态结束：发 `overloaded_error` 事件（不发 message_stop）。
+    /// 以上游中途收尾的异常终态结束：发 `overloaded_error` 事件（不发 message_stop）。
     ///
+    /// 扣住的工具调用直接丢弃（可能是半截参数，不能交给客户端执行）。
     /// `reason` 只进日志和结算记录，发给客户端的始终是固定文案。
-    pub fn thinking_only_error_events(&mut self, reason: String) -> Vec<SseEvent> {
+    pub fn truncation_error_events(&mut self, reason: String) -> Vec<SseEvent> {
         tracing::warn!(
             metering = self.metering.is_some(),
+            attempt_metered = self.attempt_metered,
             credits = self.credits,
             output_tokens = self.output_tokens,
+            held_tool_uses = self.held_tool_uses.len(),
             dropped_frames = ?self.dropped_frame_kinds,
             "{}",
             reason
         );
-        self.thinking_only_error = Some(reason);
-        self.generate_error_events(THINKING_ONLY_ERROR_TYPE, THINKING_ONLY_ERROR_MESSAGE)
+        self.held_tool_uses.clear();
+        self.truncation_error = Some(reason);
+        self.generate_error_events(TRUNCATION_ERROR_TYPE, TRUNCATION_ERROR_MESSAGE)
     }
 
-    /// 收尾时判定为「只有 thinking」异常终态的原因（此时已发出 error 事件）。
-    pub fn thinking_only_error(&self) -> Option<&str> {
-        self.thinking_only_error.as_deref()
+    /// 收尾时判定为上游中途收尾的原因（此时已发出 error 事件）。
+    pub fn truncation_error(&self) -> Option<&str> {
+        self.truncation_error.as_deref()
     }
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = self.flush_pending_buffers();
 
-        // 整条流只有 thinking、没有正文也没有工具调用：实测几乎都是上游中途收尾
-        // （没有 meteringEvent，credits=0），并不是真的耗尽了 token 预算。
-        // 以前这里伪造 stop_reason=max_tokens 并补一个空格正文，Claude Code 会据此报
-        // 「Output token limit hit」并自动续写，续写又带着这条空回合进历史，连环失败。
-        // 改为异常终态：发 error 事件而非 message_stop，这条空回合不会被当成正常完成写进历史。
-        // （流式路径在走到这里之前会先透明重试，见 handlers::ThinkingOnlyRetry。）
-        if self.is_retryable_thinking_only() {
-            events.extend(self.thinking_only_error_events(
-                "上游只返回了 thinking，没有正文或工具调用".to_string(),
-            ));
+        // 上游中途收尾（只有 thinking / 工具调用后没有 meteringEvent，credits=0）：
+        // 以前只有 thinking 时伪造 stop_reason=max_tokens 并补一个空格正文，Claude Code 会据此报
+        // 「Output token limit hit」并自动续写，续写又带着这条空回合进历史，连环失败；
+        // 被截断的工具调用则会把半截命令交给客户端执行。
+        // 改为异常终态：发 error 事件而非 message_stop，这条回合不会被当成正常完成写进历史。
+        // （流式路径在走到这里之前会先透明重试，见 handlers::TruncationRetry。）
+        if let Some(reason) = self.truncation_reason() {
+            events.extend(self.truncation_error_events(reason.to_string()));
             return events;
         }
+        // 有 meteringEvent、或上游显式给了 stop_reason：扣住的工具调用按原顺序发出。
+        events.extend(self.release_held_tool_uses());
         // 上游显式给了 stop_reason（max_tokens / 上下文满）但只有 thinking：如实透传原因，
         // 补一个空格正文，避免下游拿到只有 thinking 的 assistant 消息。
         if self.is_thinking_only() {
@@ -2832,8 +2912,8 @@ impl BufferedStreamContext {
     }
 
     /// 「只有 thinking」异常终态的原因（转发内部 StreamContext）。缓冲流据此记 error。
-    pub fn thinking_only_error(&self) -> Option<&str> {
-        self.inner.thinking_only_error()
+    pub fn truncation_error(&self) -> Option<&str> {
+        self.inner.truncation_error()
     }
 
     /// 记录没有转成客户端内容的上游帧类型（转发内部 StreamContext）。
@@ -3122,6 +3202,22 @@ mod tests {
         assert!(text.contains("hello") && text.contains("world"));
     }
 
+    /// 上游正常结束时在工具调用之后下发的 meteringEvent（扣住的工具调用据此放行）。
+    fn metering_evt() -> Event {
+        Event::Metering(MeteringEvent {
+            unit: "credit".into(),
+            unit_plural: "credits".into(),
+            usage: 0.1,
+        })
+    }
+
+    /// 上游 assistantResponseEvent（正文片段）
+    fn text_evt(content: &str) -> Event {
+        let mut ev = crate::kiro::model::events::AssistantResponseEvent::default();
+        ev.content = content.to_string();
+        Event::AssistantResponse(ev)
+    }
+
     /// 测试用的「已知工具表」：包含 invoke 测试里会合成的工具名，
     /// 让 🅳 工具表校验放行这些名字，从而能验证捞回逻辑本身。
     fn test_known_tools() -> std::collections::HashSet<String> {
@@ -3297,7 +3393,8 @@ mod tests {
             stop: true,
         });
 
-        let events = ctx.process_kiro_event(&tool_event);
+        let mut events = ctx.process_kiro_event(&tool_event);
+        events.extend(ctx.process_kiro_event(&metering_evt()));
 
         // content_block_start 中的 name 应该是原始长名称
         let start_event = events
@@ -3333,12 +3430,13 @@ mod tests {
             .expect("initial text block index should exist");
 
         // tool_use 开始会自动关闭现有 text block
-        let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let mut tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
+        tool_events.extend(ctx.process_kiro_event(&metering_evt()));
         assert!(
             tool_events.iter().any(|e| {
                 e.event == "content_block_stop"
@@ -3401,12 +3499,13 @@ mod tests {
             "short prefix should still be buffered under thinking mode"
         );
 
-        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let mut events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
+        events.extend(ctx.process_kiro_event(&metering_evt()));
 
         let text_start_index = events.iter().find_map(|e| {
             if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
@@ -3613,6 +3712,7 @@ mod tests {
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
         all_events.extend(tool_events);
+        all_events.extend(ctx.process_kiro_event(&metering_evt()));
 
         all_events.extend(ctx.generate_final_events());
 
@@ -4677,10 +4777,7 @@ mod tests {
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
         all_events.extend(ctx.flush_pending_buffers());
-        assert!(
-            ctx.is_retryable_thinking_only(),
-            "应判定为可重试的纯 thinking"
-        );
+        assert!(ctx.is_retryable_truncation(), "应判定为可重试的纯 thinking");
         all_events.extend(ctx.generate_final_events());
 
         let error = all_events
@@ -4688,7 +4785,7 @@ mod tests {
             .find(|e| e.event == "error")
             .expect("should have error event");
         assert_eq!(error.data["error"]["type"], "overloaded_error");
-        assert!(ctx.thinking_only_error().is_some());
+        assert!(ctx.truncation_error().is_some());
         assert!(
             !all_events
                 .iter()
@@ -4736,7 +4833,7 @@ mod tests {
             message: "too long".to_string(),
         }));
         all.extend(ctx.flush_pending_buffers());
-        assert!(!ctx.is_retryable_thinking_only());
+        assert!(!ctx.is_retryable_truncation());
         all.extend(ctx.generate_final_events());
 
         assert!(!all.iter().any(|e| e.event == "error"));
@@ -4790,8 +4887,8 @@ mod tests {
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
         all.extend(ctx.flush_pending_buffers());
-        assert!(ctx.is_retryable_thinking_only());
-        all.extend(ctx.prepare_thinking_only_retry());
+        assert!(ctx.is_retryable_truncation());
+        all.extend(ctx.prepare_truncation_retry());
         all.extend(ctx.process_assistant_response("<thinking>\ndef</thinking>\n\nHello"));
         all.extend(ctx.generate_final_events());
 
@@ -4824,6 +4921,278 @@ mod tests {
         assert_eq!(collect_text_content(&all), "Hello");
         let delta = all.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    /// 取所有 tool_use 块的 (id, name)，按发出顺序
+    fn tool_use_starts(events: &[SseEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .map(|e| {
+                let block = &e.data["content_block"];
+                (
+                    block["id"].as_str().unwrap_or("").to_string(),
+                    block["name"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_tool_use_without_metering_is_truncation() {
+        // 上游把半截参数闭合成合法 JSON、带 stop=true 下发，随后既没有 meteringEvent 也没有
+        // 显式 stop_reason 就收尾：工具调用不能发给客户端，以 overloaded_error 结束
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n我来跑一下"));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "exec_command",
+            r#"{"cmd":"cd /root/src && git sta"}"#,
+            true,
+        ))));
+        assert!(
+            tool_use_starts(&all).is_empty(),
+            "没有 meteringEvent 前先扣住"
+        );
+        all.extend(ctx.flush_pending_buffers());
+        assert!(ctx.truncation_reason().is_some());
+        assert!(ctx.is_retryable_truncation());
+
+        all.extend(ctx.generate_final_events());
+        assert!(
+            tool_use_starts(&all).is_empty(),
+            "半截工具调用不能发出: {:?}",
+            all
+        );
+        let err = all
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("应以 error 结束");
+        assert_eq!(err.data["error"]["type"], TRUNCATION_ERROR_TYPE);
+        assert!(!all.iter().any(|e| e.event == "message_stop"));
+        assert!(ctx.truncation_error().is_some());
+    }
+
+    #[test]
+    fn test_held_tool_use_released_in_order_before_following_text() {
+        // 工具调用后面还有正文：说明上游没在工具调用处收尾，按原顺序先发工具调用
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "tool_a",
+            r#"{"a":1}"#,
+            true,
+        ))));
+        // 纯空白不放行
+        all.extend(ctx.process_kiro_event(&text_evt("\n")));
+        assert!(tool_use_starts(&all).is_empty());
+        all.extend(ctx.process_kiro_event(&text_evt("done")));
+        let tool_pos = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("后面有正文时应放行工具调用");
+        let text_pos = all
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("done")
+            })
+            .expect("正文照常发出");
+        assert!(tool_pos < text_pos, "工具调用在后续正文之前");
+
+        all.extend(ctx.process_kiro_event(&metering_evt()));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(tool_use_starts(&all).len(), 1);
+        let delta = all.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
+    }
+    #[test]
+    fn test_truncated_tool_use_retry_drops_held_call() {
+        // 透明重试：第一段正文 + 被截断的工具调用（没有 meteringEvent），第二段完整。
+        // 扣住的半截调用直接丢弃，只发出第二段的工具调用；第一段的正文块关闭一次。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_kiro_event(&text_evt("先看看状态")));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "exec_command",
+            r#"{"cmd":"git sta"}"#,
+            true,
+        ))));
+        all.extend(ctx.flush_pending_buffers());
+        assert!(ctx.is_retryable_truncation());
+        all.extend(ctx.prepare_truncation_retry());
+
+        all.extend(ctx.process_kiro_event(&text_evt("先看看状态")));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_2",
+            "exec_command",
+            r#"{"cmd":"git status"}"#,
+            true,
+        ))));
+        all.extend(ctx.process_kiro_event(&metering_evt()));
+        all.extend(ctx.generate_final_events());
+
+        assert!(
+            !all.iter().any(|e| e.event == "error"),
+            "不应报错: {:?}",
+            all
+        );
+        assert_eq!(
+            tool_use_starts(&all),
+            vec![("tool_2".to_string(), "exec_command".to_string())]
+        );
+        let first_text_stops = all
+            .iter()
+            .filter(|e| e.event == "content_block_stop" && e.data["index"] == 0)
+            .count();
+        assert_eq!(first_text_stops, 1, "第一段正文块只关闭一次");
+        let delta = all.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_retry_ignores_metering_from_previous_attempt() {
+        // 第一次只有 thinking 但带了 meteringEvent（照样算中途收尾），重试里的工具调用
+        // 后面没有 meteringEvent：不能因为上一次的 metering 就放行这个可能半截的调用
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all.extend(ctx.process_kiro_event(&metering_evt()));
+        all.extend(ctx.flush_pending_buffers());
+        assert!(ctx.is_retryable_truncation());
+        all.extend(ctx.prepare_truncation_retry());
+
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "exec_command",
+            r#"{"cmd":"cd /root/src && git sta"}"#,
+            true,
+        ))));
+        assert!(
+            tool_use_starts(&all).is_empty(),
+            "上一次的 meteringEvent 不能放行本次的工具调用"
+        );
+        assert_eq!(ctx.held_tool_uses.len(), 1, "工具调用应被扣住而不是丢失");
+        all.extend(ctx.flush_pending_buffers());
+        assert!(ctx.truncation_reason().is_some());
+
+        all.extend(ctx.generate_final_events());
+        assert!(tool_use_starts(&all).is_empty());
+        let err = all
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("应以 error 结束");
+        assert_eq!(err.data["error"]["type"], TRUNCATION_ERROR_TYPE);
+    }
+
+    #[test]
+    fn test_truncation_after_released_tool_use_is_not_retried() {
+        // 已经发给客户端的工具调用无法撤回，重试会执行两遍：这种情况不重试，直接报错
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "tool_a",
+            r#"{"a":1}"#,
+            true,
+        ))));
+        all.extend(ctx.process_kiro_event(&text_evt("接着")));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_2",
+            "tool_b",
+            r#"{"b":"半截"}"#,
+            true,
+        ))));
+        all.extend(ctx.flush_pending_buffers());
+        assert!(ctx.truncation_reason().is_some());
+        assert!(!ctx.is_retryable_truncation());
+
+        all.extend(ctx.generate_final_events());
+        assert_eq!(
+            tool_use_starts(&all),
+            vec![("tool_1".to_string(), "tool_a".to_string())],
+            "只有已放行的那个工具调用"
+        );
+        let err = all
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("应以 error 结束");
+        assert_eq!(err.data["error"]["type"], TRUNCATION_ERROR_TYPE);
+    }
+
+    #[test]
+    fn test_explicit_stop_reason_releases_held_tool_use() {
+        // 上游显式给了 stop_reason（ContentLengthExceeded）：是真实终态，扣住的工具调用照常发出
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "tool_1",
+            "tool_a",
+            r#"{"a":1}"#,
+            true,
+        ))));
+        all.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        }));
+        all.extend(ctx.flush_pending_buffers());
+        assert!(ctx.truncation_reason().is_none());
+        all.extend(ctx.generate_final_events());
+        assert_eq!(tool_use_starts(&all).len(), 1);
+        assert!(!all.iter().any(|e| e.event == "error"));
+        let delta = all.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
     }
 
     #[test]
@@ -4875,6 +5244,7 @@ mod tests {
                 stop: true,
             }),
         );
+        all_events.extend(ctx.process_kiro_event(&metering_evt()));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events

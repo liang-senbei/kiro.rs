@@ -970,26 +970,27 @@ async fn handle_stream_request(
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
-    // 只有 thinking、没有正文时透明重试（只在启用 thinking 时才可能出现这种终态）
-    let retry = if thinking_enabled {
+    // 上游中途收尾（只有 thinking / 工具调用后没有 meteringEvent）时透明重试。
+    // 实测这类收尾是一阵一阵的（同一凭据连续几次，常伴随 429），立刻重发大概率撞上同一阵，
+    // 所以每次重试前按次数退避。
+    let retry = {
         let request_body: std::sync::Arc<str> = request_body.into();
         let tracer = tracer.clone();
-        Some(ThinkingOnlyRetry::new(
-            THINKING_ONLY_MAX_RETRIES,
-            move || {
-                let provider = provider.clone();
-                let request_body = request_body.clone();
-                let tracer = tracer.clone();
-                let group = group.clone();
-                async move {
-                    provider
-                        .call_api_stream(&request_body, Some(tracer.as_ref()), group.as_deref())
-                        .await
-                }
-            },
-        ))
-    } else {
-        None
+        let mut attempt = 0u32;
+        Some(TruncationRetry::new(TRUNCATION_MAX_RETRIES, move || {
+            attempt += 1;
+            let delay = TRUNCATION_RETRY_BACKOFF * attempt;
+            let provider = provider.clone();
+            let request_body = request_body.clone();
+            let tracer = tracer.clone();
+            let group = group.clone();
+            async move {
+                tokio::time::sleep(delay).await;
+                provider
+                    .call_api_stream(&request_body, Some(tracer.as_ref()), group.as_deref())
+                    .await
+            }
+        }))
     };
 
     // 创建流处理上下文
@@ -1029,8 +1030,11 @@ async fn handle_stream_request(
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
-/// 「只有 thinking、没有正文 / 工具调用」时在同一条 SSE 流内透明重试的最大次数
-const THINKING_ONLY_MAX_RETRIES: u32 = 2;
+/// 上游中途收尾（只有 thinking / 工具调用后没有 meteringEvent）时在同一条 SSE 流内透明重试的最大次数
+const TRUNCATION_MAX_RETRIES: u32 = 2;
+
+/// 透明重试的退避基数：第 n 次重试前等 n 倍
+const TRUNCATION_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
 
 type RetryCallFuture = std::pin::Pin<
     Box<
@@ -1039,23 +1043,26 @@ type RetryCallFuture = std::pin::Pin<
     >,
 >;
 
-/// 「只有 thinking」终态的透明重试器。
+/// 上游中途收尾的透明重试器。
 ///
-/// 实测这种终态几乎都是上游中途收尾（没有 meteringEvent，credits=0），同样的请求
-/// 重发一次通常就能拿到正文。已发出的 thinking 块照常关闭，新响应的内容块接在后面，
-/// 客户端看到的仍是一条完整的消息；重试用尽才以 `overloaded_error` 结束。
-struct ThinkingOnlyRetry {
+/// 实测「只有 thinking」和「工具调用后没有 meteringEvent」都是上游中途收尾（credits=0），
+/// 同样的请求重发通常就能拿到完整结果。已发出的 thinking / 正文块照常关闭，扣住的工具调用
+/// 直接丢弃，新响应的内容块接在后面，客户端看到的仍是一条完整的消息；重试用尽才以
+/// `overloaded_error` 结束。
+struct TruncationRetry {
     /// 剩余可重试次数
     remaining: u32,
     /// 已发起的重试次数
     attempts: u32,
+    /// 最近一次触发重试的原因（重试请求本身失败时写进结算记录）
+    last_reason: &'static str,
     /// 重新发起同一个上游请求
     start: Box<dyn FnMut() -> RetryCallFuture + Send>,
     /// 进行中的重试请求（等待期间照常发 ping）
     in_flight: Option<RetryCallFuture>,
 }
 
-impl ThinkingOnlyRetry {
+impl TruncationRetry {
     fn new<F, Fut>(max_retries: u32, mut start: F) -> Self
     where
         F: FnMut() -> Fut + Send + 'static,
@@ -1066,6 +1073,7 @@ impl ThinkingOnlyRetry {
         Self {
             remaining: max_retries,
             attempts: 0,
+            last_reason: "上游中途收尾",
             start: Box::new(move || Box::pin(start()) as RetryCallFuture),
             in_flight: None,
         }
@@ -1114,7 +1122,7 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
-    retry: Option<ThinkingOnlyRetry>,
+    retry: Option<TruncationRetry>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1134,7 +1142,7 @@ fn create_sse_stream(
                 return None;
             }
 
-            // 「只有 thinking」透明重试进行中：等新的上游响应，期间照常发 ping 保活
+            // 透明重试进行中：等新的上游响应，期间照常发 ping 保活
             if let Some(mut call) = retry.as_mut().and_then(|r| r.in_flight.take()) {
                 tokio::select! {
                     result = &mut call => {
@@ -1146,8 +1154,9 @@ fn create_sse_stream(
                                 return Some((stream::iter(Vec::new()), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
                             }
                             Err(e) => {
-                                let reason = format!("只有 thinking，透明重试请求失败: {}", e);
-                                let final_events = ctx.thinking_only_error_events(reason.clone());
+                                let cause = retry.as_ref().map_or("上游中途收尾", |r| r.last_reason);
+                                let reason = format!("{}，透明重试请求失败: {}", cause, e);
+                                let final_events = ctx.truncation_error_events(reason.clone());
                                 settlement.update(&ctx, sent_bytes);
                                 settlement.finish(
                                     "error",
@@ -1231,20 +1240,23 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
                         }
                         None => {
-                            // 只有 thinking、没有正文：还有重试次数就在同一条流里透明重试
+                            // 上游中途收尾：还有重试次数就在同一条流里透明重试
                             let mut events = ctx.flush_pending_buffers();
-                            if ctx.is_retryable_thinking_only()
+                            if ctx.is_retryable_truncation()
+                                && let Some(reason) = ctx.truncation_reason()
                                 && let Some(r) = retry.as_mut().filter(|r| r.remaining > 0)
                             {
                                 r.remaining -= 1;
                                 r.attempts += 1;
+                                r.last_reason = reason;
                                 tracing::warn!(
                                     attempt = r.attempts,
                                     credits = ctx.credits,
                                     output_tokens = ctx.output_tokens,
-                                    "上游只返回了 thinking，没有正文或工具调用，透明重试"
+                                    "{}，透明重试",
+                                    reason
                                 );
-                                events.extend(ctx.prepare_thinking_only_retry());
+                                events.extend(ctx.prepare_truncation_retry());
                                 r.in_flight = Some((r.start)());
                                 settlement.update(&ctx, sent_bytes);
                                 return Some((stream::iter(sse_bytes(events)), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
@@ -1266,8 +1278,8 @@ fn create_sse_stream(
                                     Some(&message),
                                     None,
                                 );
-                            } else if let Some(reason) = ctx.thinking_only_error() {
-                                // 重试用尽仍只有 thinking：按上游中途收尾记 interrupted
+                            } else if let Some(reason) = ctx.truncation_error() {
+                                // 重试用尽仍是上游中途收尾：记 interrupted
                                 let message = format!("{}（透明重试 {} 次）", reason, retried);
                                 settlement.finish(
                                     "error",
@@ -1278,7 +1290,7 @@ fn create_sse_stream(
                                 );
                             } else {
                                 if retried > 0 {
-                                    tracing::info!(retried, "透明重试后拿到了正文");
+                                    tracing::info!(retried, "透明重试后拿到了完整响应");
                                 }
                                 settlement.finish("success", "success", None, None, None);
                             }
@@ -2336,7 +2348,7 @@ fn create_buffered_sse_stream(
                                         None,
                                         trace_usage,
                                     );
-                                } else if let Some(reason) = ctx.thinking_only_error() {
+                                } else if let Some(reason) = ctx.truncation_error() {
                                     // 只有 thinking、没有正文：上游中途收尾，error 事件已随缓冲发出
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
                                     tracer.finalize(
@@ -2891,20 +2903,17 @@ mod tests {
 
     // ---- 「只有 thinking」透明重试：手工构造上游 event-stream 帧 ----
 
-    /// 按 AWS event-stream 格式编码一个 assistantResponseEvent 帧
-    fn assistant_frame(content: &str) -> Vec<u8> {
+    /// 按 AWS event-stream 格式编码一个事件帧
+    fn event_frame(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
         let mut headers = Vec::new();
-        for (name, value) in [
-            (":message-type", "event"),
-            (":event-type", "assistantResponseEvent"),
-        ] {
+        for (name, value) in [(":message-type", "event"), (":event-type", event_type)] {
             headers.push(name.len() as u8);
             headers.extend_from_slice(name.as_bytes());
             headers.push(7); // String
             headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
             headers.extend_from_slice(value.as_bytes());
         }
-        let payload = serde_json::to_vec(&json!({ "content": content })).unwrap();
+        let payload = serde_json::to_vec(&payload).unwrap();
         let total_len = (12 + headers.len() + payload.len() + 4) as u32;
         let mut frame = Vec::new();
         frame.extend_from_slice(&total_len.to_be_bytes());
@@ -2918,9 +2927,33 @@ mod tests {
         frame
     }
 
+    fn assistant_frame(content: &str) -> Vec<u8> {
+        event_frame("assistantResponseEvent", json!({ "content": content }))
+    }
+
+    /// 一次性下发完整参数的 toolUseEvent 帧
+    fn tool_use_frame(id: &str, name: &str, input: &str) -> Vec<u8> {
+        event_frame(
+            "toolUseEvent",
+            json!({ "toolUseId": id, "name": name, "input": input, "stop": true }),
+        )
+    }
+
+    fn metering_frame() -> Vec<u8> {
+        event_frame(
+            "meteringEvent",
+            json!({ "unit": "credit", "unitPlural": "credits", "usage": 0.1 }),
+        )
+    }
+
     /// 模拟一次上游流式响应：依次下发给定的 assistant 文本分片
     fn upstream_call(chunks: &[&str]) -> crate::kiro::provider::KiroCallResult {
-        let body: Vec<u8> = chunks.iter().flat_map(|c| assistant_frame(c)).collect();
+        upstream_frames(chunks.iter().map(|c| assistant_frame(c)).collect())
+    }
+
+    /// 模拟一次上游流式响应：依次下发给定的原始帧
+    fn upstream_frames(frames: Vec<Vec<u8>>) -> crate::kiro::provider::KiroCallResult {
+        let body: Vec<u8> = frames.concat();
         crate::kiro::provider::KiroCallResult {
             response: reqwest::Response::from(http::Response::new(body)),
             credential_id: 42,
@@ -2988,7 +3021,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = calls.clone();
         retries.reverse();
-        let retry = ThinkingOnlyRetry::new(THINKING_ONLY_MAX_RETRIES, move || {
+        let retry = TruncationRetry::new(TRUNCATION_MAX_RETRIES, move || {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let next = retries.pop().expect("重试次数超出预期");
             async move { next }
@@ -3061,7 +3094,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(calls, THINKING_ONLY_MAX_RETRIES as usize);
+        assert_eq!(calls, TRUNCATION_MAX_RETRIES as usize);
         let (last_event, last_data) = events.last().unwrap();
         assert_eq!(last_event, "error");
         assert_eq!(last_data["error"]["type"], "overloaded_error");
@@ -3112,6 +3145,97 @@ mod tests {
         .await;
 
         assert_eq!(calls, 0);
+        assert_eq!(events.last().unwrap().0, "message_stop");
+    }
+
+    // ---- 「工具调用后静默收尾（没有 meteringEvent）」透明重试 ----
+
+    fn tool_use_ids(events: &[(String, serde_json::Value)]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|(event, data)| {
+                event == "content_block_start" && data["content_block"]["type"] == "tool_use"
+            })
+            .map(|(_, data)| data["content_block"]["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tool_call_without_metering_is_retried_transparently() {
+        // 参数 JSON 本身合法，但上游在工具调用后没发 meteringEvent 就收尾了：命令可能是半截的
+        let truncated = upstream_frames(vec![
+            assistant_frame("I'll run it."),
+            tool_use_frame("tooluse_a", "Bash", r#"{"command":"cat <<EOF > a.txt"}"#),
+        ]);
+        let complete = upstream_frames(vec![
+            assistant_frame("Running."),
+            tool_use_frame("tooluse_b", "Bash", r#"{"command":"ls"}"#),
+            metering_frame(),
+        ]);
+        let (events, calls, aggregator) = run_thinking_stream(truncated, vec![Ok(complete)]).await;
+
+        assert_eq!(calls, 1, "只应重试一次");
+        assert!(
+            !events.iter().any(|(e, _)| e == "error"),
+            "不应报错: {:?}",
+            events
+        );
+        assert_eq!(
+            tool_use_ids(&events),
+            vec!["tooluse_b"],
+            "截断那次的工具调用不能发给客户端"
+        );
+        let (_, delta) = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+        assert_eq!(events.last().unwrap().0, "message_stop");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn tool_call_without_metering_ends_with_overloaded_error_after_retries() {
+        let truncated = || {
+            upstream_frames(vec![tool_use_frame(
+                "tooluse_a",
+                "Bash",
+                r#"{"command":"cat <<EOF > a.txt"}"#,
+            )])
+        };
+        let (events, calls, aggregator) =
+            run_thinking_stream(truncated(), vec![Ok(truncated()), Ok(truncated())]).await;
+
+        assert_eq!(calls, TRUNCATION_MAX_RETRIES as usize);
+        assert!(
+            tool_use_ids(&events).is_empty(),
+            "可能被截断的工具调用不能发给客户端"
+        );
+        let (last_event, last_data) = events.last().unwrap();
+        assert_eq!(last_event, "error");
+        assert_eq!(last_data["error"]["type"], "overloaded_error");
+        assert!(
+            !events
+                .iter()
+                .any(|(e, _)| e == "message_delta" || e == "message_stop")
+        );
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn tool_call_with_metering_is_not_retried() {
+        let (events, calls, _) = run_thinking_stream(
+            upstream_frames(vec![
+                tool_use_frame("tooluse_a", "Bash", r#"{"command":"ls"}"#),
+                metering_frame(),
+            ]),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(calls, 0);
+        assert_eq!(tool_use_ids(&events), vec!["tooluse_a"]);
+        let (_, delta) = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
         assert_eq!(events.last().unwrap().0, "message_stop");
     }
 }
