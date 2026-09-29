@@ -60,14 +60,15 @@ fn normalize_ip(raw: &str) -> String {
 /// 从请求中提取 API Key
 ///
 /// 支持两种认证方式：
-/// - `x-api-key` header
-/// - `Authorization: Bearer <token>` header
+/// - `x-api-key` header（空值视为未提供，回退到 Authorization）
+/// - `Authorization: Bearer <token>` header（scheme 大小写不敏感，见 RFC 7235）
 pub fn extract_api_key(request: &Request<Body>) -> Option<String> {
     // 优先检查 x-api-key
     if let Some(key) = request
         .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
+        .filter(|k| !k.is_empty())
     {
         return Some(key.to_string());
     }
@@ -77,8 +78,12 @@ pub fn extract_api_key(request: &Request<Body>) -> Option<String> {
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
+        .and_then(|v| v.split_once(' '))
+        .and_then(|(scheme, token)| {
+            scheme
+                .eq_ignore_ascii_case("bearer")
+                .then(|| token.to_string())
+        })
 }
 
 /// 常量时间字符串比较，防止时序攻击
@@ -149,5 +154,32 @@ mod tests {
     fn ignores_empty_forwarded_header() {
         let req = req_with(&[("x-forwarded-for", " ")], Some("10.0.0.2:4567"));
         assert_eq!(extract_client_ip(&req).as_deref(), Some("10.0.0.2"));
+    }
+
+    #[test]
+    fn extracts_bearer_case_insensitively() {
+        for auth in ["Bearer sk-1", "bearer sk-1", "BEARER sk-1"] {
+            let req = req_with(&[("authorization", auth)], None);
+            assert_eq!(extract_api_key(&req).as_deref(), Some("sk-1"), "{auth}");
+        }
+        let req = req_with(&[("authorization", "Basic c2stMQ==")], None);
+        assert_eq!(extract_api_key(&req), None);
+        let req = req_with(&[("authorization", "Bearer")], None);
+        assert_eq!(extract_api_key(&req), None);
+    }
+
+    #[test]
+    fn x_api_key_preferred_and_empty_falls_back() {
+        let req = req_with(
+            &[("x-api-key", "sk-x"), ("authorization", "Bearer sk-b")],
+            None,
+        );
+        assert_eq!(extract_api_key(&req).as_deref(), Some("sk-x"));
+
+        let req = req_with(&[("x-api-key", ""), ("authorization", "Bearer sk-b")], None);
+        assert_eq!(extract_api_key(&req).as_deref(), Some("sk-b"));
+
+        let req = req_with(&[("x-api-key", "")], None);
+        assert_eq!(extract_api_key(&req), None);
     }
 }
