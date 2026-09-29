@@ -2,6 +2,8 @@
 
 **该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
 
+> 本仓库 fork 自 [ZyphrZero/kiro.rs](https://github.com/ZyphrZero/kiro.rs)。原作者为 [hank9999](https://github.com/hank9999)，上游当前由 [ZyphrZero](https://github.com/ZyphrZero) 维护；完整提交历史与作者信息均已保留，并继续以 MIT 协议分发。
+
 Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 
 `kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 与 OpenAI Chat Completions / Responses API 兼容代理。它把 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 等请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
@@ -862,7 +864,7 @@ git diff --check
 <a id="license"></a>
 ## License
 
-见 [LICENSE](LICENSE)。
+本项目以 MIT 协议发布，见 [LICENSE](LICENSE)。版权归原作者 [hank9999](https://github.com/hank9999) 及各位贡献者所有；本 fork 的修改同样以 MIT 协议提供。
 
 <a id="community"></a>
 ## 💬 社区支持
@@ -877,6 +879,7 @@ git diff --check
 本项目的实现离不开社区项目和反馈的帮助：
 
 - [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs)
+- [ZyphrZero/kiro.rs](https://github.com/ZyphrZero/kiro.rs)
 - [kiro2api](https://github.com/caidaoli/kiro2api)
 - [proxycast](https://github.com/aiclientproxy/proxycast)
 - [Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)
