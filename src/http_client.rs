@@ -76,10 +76,34 @@ pub fn build_client(
         }
 
         builder = builder.proxy(proxy);
-        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+        tracing::debug!(
+            "HTTP Client 使用代理: {}",
+            redact_proxy_url(&proxy_config.url)
+        );
     }
 
     Ok(builder.build()?)
+}
+
+/// 日志用：隐藏代理 URL 中内嵌的 `user:pass@` 凭据
+///
+/// `http://user:pass@host:port` → `http://***@host:port`；无凭据时原样返回。
+pub fn redact_proxy_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => {
+            let host = &rest[at + 1..];
+            match scheme {
+                Some(scheme) => format!("{scheme}://***@{host}"),
+                None => format!("***@{host}"),
+            }
+        }
+        None => url.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +137,30 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_redact_proxy_url() {
+        assert_eq!(
+            redact_proxy_url("http://user:p%40ss@127.0.0.1:7890"),
+            "http://***@127.0.0.1:7890"
+        );
+        assert_eq!(
+            redact_proxy_url("socks5h://user@proxy.example.com:1080/path?q=@x"),
+            "socks5h://***@proxy.example.com:1080/path?q=@x"
+        );
+        assert_eq!(
+            redact_proxy_url("user:pass@127.0.0.1:7890"),
+            "***@127.0.0.1:7890"
+        );
+        // 无凭据：原样返回（路径 / query 中的 @ 不视为凭据）
+        assert_eq!(
+            redact_proxy_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            redact_proxy_url("http://127.0.0.1:7890/a@b"),
+            "http://127.0.0.1:7890/a@b"
+        );
     }
 }

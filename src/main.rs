@@ -106,8 +106,11 @@ async fn main() {
             proxy
         });
 
-    if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+    if let Some(proxy) = &proxy_config {
+        tracing::info!(
+            "已配置 HTTP 代理: {}",
+            http_client::redact_proxy_url(&proxy.url)
+        );
     }
 
     // 启动 Kiro IDE 版本自动获取：从官方元数据端点拉取 currentRelease，
