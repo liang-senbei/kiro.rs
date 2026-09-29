@@ -89,9 +89,6 @@ fn archive_filename(version: &str) -> Result<String, AdminServiceError> {
 /// 下载并校验某个 release 版本的二进制压缩包，把内部的 `kiro-rs` 提取到 `dest`。
 ///
 /// `proxy` 为 `Some` 时所有 HTTP 请求走该代理（与项目其它出站路径一致）。
-/// 下载并校验某个 release 版本的二进制压缩包，把内部的 `kiro-rs` 提取到 `dest`。
-///
-/// `proxy` 为 `Some` 时所有 HTTP 请求走该代理（与项目其它出站路径一致）。
 /// `github_token` 不为空时给所有请求带上 `Authorization: Bearer <token>`，
 /// 把 GitHub API 限流从匿名 60/h 提升到认证 5000/h。
 pub async fn download_release_binary(
@@ -128,6 +125,8 @@ pub async fn download_release_binary(
     fs::create_dir_all(&tmp_dir).map_err(|e| {
         AdminServiceError::InternalError(format!("创建更新临时目录失败: {}", e))
     })?;
+    // 任何返回路径（含校验失败、请求被取消）都清理临时目录，避免残留最大 200MB 的压缩包
+    let _tmp_guard = TempDirGuard(tmp_dir.clone());
     let archive_path = tmp_dir.join(&archive);
 
     download_to_file(&client, &archive_url, token.as_deref(), &archive_path).await?;
@@ -152,10 +151,16 @@ pub async fn download_release_binary(
         AdminServiceError::InternalError(format!("拷贝新二进制失败: {}", e))
     })?;
     set_executable(dest)?;
-
-    // 清理临时目录（失败仅记录，不影响主流程）
-    let _ = fs::remove_dir_all(&tmp_dir);
     Ok(())
+}
+
+/// drop 时删除目录（清理失败仅忽略，不影响主流程）
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 pub(super) fn build_http_client(
@@ -470,4 +475,20 @@ pub fn schedule_self_exit(delay: std::time::Duration) {
         let _ = std::io::stdout().flush();
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_dir_guard_removes_dir_on_drop() {
+        let dir = std::env::temp_dir().join(format!("kiro_test_tmp_guard_{}", std::process::id()));
+        fs::create_dir_all(dir.join("extract")).unwrap();
+        fs::write(dir.join("archive.tar.gz"), b"partial").unwrap();
+        {
+            let _guard = TempDirGuard(dir.clone());
+        }
+        assert!(!dir.exists());
+    }
 }
