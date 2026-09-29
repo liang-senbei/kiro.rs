@@ -280,7 +280,7 @@ impl ProxyPoolManager {
         };
         let entries = self.entries.lock();
         let json = serde_json::to_string_pretty(&*entries)?;
-        std::fs::write(path, json)?;
+        crate::common::fs::write_atomic(path, json)?;
         Ok(())
     }
 }

@@ -83,7 +83,7 @@ impl GroupManager {
         list.sort_by(|a, b| a.name.cmp(&b.name));
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = crate::common::fs::write_atomic(path, json) {
                     tracing::warn!("写入分组文件失败: {}", e);
                 }
             }

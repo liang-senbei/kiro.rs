@@ -2785,7 +2785,7 @@ impl AdminService {
 
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = crate::common::fs::write_atomic(path, json) {
                     tracing::warn!("保存余额缓存失败: {}", e);
                 }
             }
