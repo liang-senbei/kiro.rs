@@ -161,7 +161,7 @@ async fn run_callback_server(
 
                 let body = format!(
                     "<html><head><meta charset='utf-8'><title>登录失败</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10007; 登录失败</h2><p>{}</p><p style='color:#888;font-size:13px'>请关闭此标签页并重试。</p></body></html>",
-                    error_msg
+                    html_escape(&error_msg)
                 );
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -300,6 +300,22 @@ fn parse_query_string(query: &str) -> std::collections::HashMap<String, String> 
         .collect()
 }
 
+/// HTML 文本转义：回调页会回显 query 中的 error 参数，防止反射型 XSS
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// 用 authorization code 换取 access_token + refresh_token
 pub async fn exchange_code_for_token(
     auth_endpoint: &str,
@@ -359,5 +375,14 @@ mod tests {
         let expected = base64url_encode(&Sha256::digest(verifier.as_bytes()));
         assert_eq!(challenge, expected);
         assert_ne!(generate_pkce().0, verifier);
+    }
+
+    #[test]
+    fn html_escape_neutralizes_markup() {
+        assert_eq!(
+            html_escape(r#"<script>alert("x")</script>&'"#),
+            "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;&#39;"
+        );
+        assert_eq!(html_escape("用户取消登录"), "用户取消登录");
     }
 }
