@@ -382,28 +382,40 @@ async fn main() {
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
+    let admin_enabled = config
+        .admin_api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty());
     tracing::info!("启动 Anthropic API 端点: {}", addr);
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
-    tracing::info!("Admin API:");
-    tracing::info!("  GET  /api/admin/credentials");
-    tracing::info!("  POST /api/admin/credentials/:index/disabled");
-    tracing::info!("  POST /api/admin/credentials/:index/priority");
-    tracing::info!("  POST /api/admin/credentials/:index/reset");
-    tracing::info!("  GET  /api/admin/credentials/:index/balance");
-    tracing::info!("Admin UI:");
-    tracing::info!("  GET  /admin");
+    tracing::info!("  POST /v1/chat/completions");
+    tracing::info!("  POST /v1/responses");
+    tracing::info!("  POST /cc/v1/messages");
+    tracing::info!("  POST /cc/v1/messages/count_tokens");
+    if admin_enabled {
+        tracing::info!("Admin API: /api/admin/*");
+        tracing::info!("Admin UI:  GET /admin");
+    }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("监听 {} 失败（端口被占用或地址无效？）: {}", addr, e);
+            std::process::exit(1);
+        });
     // with_connect_info：把 TCP 对端地址注入请求扩展，直连部署下作为客户端 IP 的兜底
-    axum::serve(
+    if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
-    .unwrap();
+    {
+        tracing::error!("HTTP 服务异常退出: {}", e);
+        std::process::exit(1);
+    }
 }
 
 /// 文件不存在时初始化配置/凭证文件
