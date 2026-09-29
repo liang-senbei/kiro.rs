@@ -2395,19 +2395,15 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 原子落盘：先写临时文件再 rename（同目录 rename 原子），避免崩溃 / 并发导致半截文件。
-        let tmp = path.with_extension("json.tmp");
-        let write_atomic = || -> std::io::Result<()> {
-            std::fs::write(&tmp, &json)?;
-            std::fs::rename(&tmp, path)
-        };
+        // 原子落盘（同目录 tmp + rename），避免崩溃 / 并发导致半截文件；
+        // write_atomic 会沿用原文件的权限与属主，refresh token 不会因重写变成他人可读。
+        let write = || crate::common::fs::write_atomic(path, &json);
         let write_result = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(write_atomic)
+            tokio::task::block_in_place(write)
         } else {
-            write_atomic()
+            write()
         };
         if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&tmp); // 清理可能残留的临时文件
             return Err(e).with_context(|| format!("回写凭据文件失败: {:?}", path));
         }
 
@@ -6852,6 +6848,37 @@ mod tests {
         assert!(!tmp.exists(), "原子落盘后不应残留临时文件");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// persist_credentials 重写凭据文件后保留原文件权限（如 0600），
+    /// 不会因 tmp + rename 变成新建文件的默认权限（通常 0644）。
+    #[cfg(unix)]
+    #[test]
+    fn persist_credentials_keeps_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_creds_path("persist_mode");
+        let cred = KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("tok_mode".repeat(5)),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&cred]).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.persist_credentials().unwrap(), "persist 应写盘成功");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600, "重写后应保留原文件权限");
     }
 
     // ===== 账号分组隔离回归测试 =====
