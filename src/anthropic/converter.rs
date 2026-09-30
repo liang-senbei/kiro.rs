@@ -486,6 +486,19 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     Some(normalized.as_str().to_string())
 }
 
+/// 上游中途收尾后第 `retry` 次透明重试（从 1 起）应改用的 effort。
+///
+/// 实测 `max` 在个别上下文上会确定性地只回 thinking、不下发 meteringEvent，原样重发
+/// 没用，降一档就能正常出结果。所以每重试一次降一档，最低降到 `high`；不需要改
+/// （首次请求 / 本来就不高于 `high` / 无法识别的取值）时返回 `None`，沿用原请求。
+pub(crate) fn retry_effort(original: &str, retry: u32) -> Option<&'static str> {
+    const LADDER: [EffortTier; 3] = [EffortTier::Max, EffortTier::XHigh, EffortTier::High];
+    let tier = EffortTier::parse(original)?;
+    let start = LADDER.iter().position(|t| *t == tier)?;
+    let target = LADDER[(start + retry as usize).min(LADDER.len() - 1)];
+    (target != tier).then_some(target.as_str())
+}
+
 fn model_supports_xhigh_effort(model_id: &str) -> bool {
     let model = model_id.to_ascii_lowercase();
 
@@ -2502,6 +2515,24 @@ mod tests {
             "high",
             "unknown effort values should fall back instead of causing upstream validation errors"
         );
+    }
+
+    #[test]
+    fn retry_effort_steps_down_one_tier_per_retry_until_high() {
+        assert_eq!(retry_effort("max", 0), None, "首次请求不降档");
+        assert_eq!(retry_effort("max", 1), Some("xhigh"));
+        assert_eq!(retry_effort("max", 2), Some("high"));
+        assert_eq!(retry_effort("max", 3), Some("high"), "最低降到 high");
+        assert_eq!(
+            retry_effort("  MAX ", 1),
+            Some("xhigh"),
+            "大小写 / 空白同下发口径"
+        );
+        assert_eq!(retry_effort("xhigh", 1), Some("high"));
+        assert_eq!(retry_effort("xhigh", 2), Some("high"));
+        for effort in ["high", "medium", "low", "none", "extreme", ""] {
+            assert_eq!(retry_effort(effort, 1), None, "{effort:?} 不应降档");
+        }
     }
 
     // ---- Fix 3: 原生 thinking effort 下发拓宽 + budget 推导 ----

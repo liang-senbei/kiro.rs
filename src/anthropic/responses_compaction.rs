@@ -261,6 +261,8 @@ async fn run_attempt(
         cache_usage,
         tracer,
         key_ctx.group.clone(),
+        // 压缩请求按 Compact 转换，不能用 Generate 重建降档请求
+        None,
     )
     .await
     .map_err(|error| match error {

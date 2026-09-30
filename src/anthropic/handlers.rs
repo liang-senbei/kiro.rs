@@ -889,10 +889,12 @@ pub async fn post_messages(
                 is_stream: true,
             },
         ));
+        let model = payload.model.clone();
+        let effort_downgrade = RetryEffortDowngrade::new(payload, state.tool_compatibility_mode);
         handle_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &model,
             total_input_tokens,
             thinking_enabled,
             tool_name_map,
@@ -901,6 +903,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            effort_downgrade,
         )
         .await
     } else {
@@ -917,10 +920,12 @@ pub async fn post_messages(
                 is_stream: false,
             },
         ));
+        let model = payload.model.clone();
+        let effort_downgrade = RetryEffortDowngrade::new(payload, state.tool_compatibility_mode);
         handle_non_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &model,
             total_input_tokens,
             extract_thinking,
             tool_name_map,
@@ -929,6 +934,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            effort_downgrade,
         )
         .await
     }
@@ -947,6 +953,7 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    mut effort_downgrade: Option<RetryEffortDowngrade>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -972,7 +979,8 @@ async fn handle_stream_request(
 
     // 上游中途收尾（只有 thinking / 工具调用后没有 meteringEvent）时透明重试。
     // 实测这类收尾是一阵一阵的（同一凭据连续几次，常伴随 429），立刻重发大概率撞上同一阵，
-    // 所以每次重试前按次数退避。
+    // 所以每次重试前按次数退避。客户端要了高于 high 的 effort 时，每次重试再降一档
+    // （见 RetryEffortDowngrade）。
     let retry = {
         let request_body: std::sync::Arc<str> = request_body.into();
         let tracer = tracer.clone();
@@ -981,7 +989,10 @@ async fn handle_stream_request(
             attempt += 1;
             let delay = TRUNCATION_RETRY_BACKOFF * attempt;
             let provider = provider.clone();
-            let request_body = request_body.clone();
+            let request_body = effort_downgrade
+                .as_mut()
+                .and_then(|d| d.body_for_retry(attempt))
+                .map_or_else(|| request_body.clone(), std::sync::Arc::from);
             let tracer = tracer.clone();
             let group = group.clone();
             async move {
@@ -1076,6 +1087,65 @@ impl TruncationRetry {
             last_reason: "上游中途收尾",
             start: Box::new(move || Box::pin(start()) as RetryCallFuture),
             in_flight: None,
+        }
+    }
+}
+
+/// 透明重试时逐次降低 reasoning effort（策略见 [`super::converter::retry_effort`]）。
+///
+/// 改的是请求本身的 `output_config.effort` 再重新转换，thinking 前缀里的
+/// `<thinking_effort>` 和 `additionalModelRequestFields` 一起变；不在序列化后的请求体上
+/// 做字符串替换，用户内容里可能出现同样的标签。
+pub(crate) struct RetryEffortDowngrade {
+    payload: MessagesRequest,
+    /// 客户端原始 effort；每次按它和重试次数重新计算，不叠加
+    original_effort: String,
+    tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
+}
+
+impl RetryEffortDowngrade {
+    /// 客户端显式要了高于 `high` 的 effort 才需要降档，否则重试沿用原请求体
+    fn new(
+        payload: MessagesRequest,
+        tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
+    ) -> Option<Self> {
+        let original_effort = payload.output_config.as_ref()?.effort.clone();
+        super::converter::retry_effort(&original_effort, 1)?;
+        Some(Self {
+            payload,
+            original_effort,
+            tool_compatibility_mode,
+        })
+    }
+
+    /// 第 `retry` 次重试（从 1 起）的请求体；不需要降档或重建失败时返回 `None`，沿用原请求体
+    fn body_for_retry(&mut self, retry: u32) -> Option<String> {
+        let effort = super::converter::retry_effort(&self.original_effort, retry)?;
+        self.payload.output_config.as_mut()?.effort = effort.to_string();
+        let rebuilt = convert_request_with_mode(&self.payload, self.tool_compatibility_mode)
+            .map_err(|e| e.to_string())
+            .and_then(|conversion| {
+                serde_json::to_string(&KiroRequest {
+                    conversation_state: conversion.conversation_state,
+                    profile_arn: None,
+                    additional_model_request_fields: conversion.additional_model_request_fields,
+                })
+                .map_err(|e| e.to_string())
+            });
+        match rebuilt {
+            Ok(body) => {
+                tracing::info!(
+                    retry,
+                    original_effort = %self.original_effort,
+                    effort,
+                    "透明重试降低 reasoning effort"
+                );
+                Some(body)
+            }
+            Err(e) => {
+                tracing::warn!("重建降档请求失败，沿用原请求: {}", e);
+                None
+            }
         }
     }
 }
@@ -1457,6 +1527,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    effort_downgrade: Option<RetryEffortDowngrade>,
 ) -> Response {
     match execute_non_stream_request(
         provider,
@@ -1469,6 +1540,7 @@ async fn handle_non_stream_request(
         cache_usage,
         tracer,
         group,
+        effort_downgrade,
     )
     .await
     {
@@ -1489,21 +1561,26 @@ pub(crate) async fn execute_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    mut effort_downgrade: Option<RetryEffortDowngrade>,
 ) -> Result<serde_json::Value, NonStreamExecutionError> {
     let provider = provider.as_ref();
     let sink: &RequestTracer = &tracer;
     let group = group.as_deref();
-    // 中途收尾后的重试按次数退避，理由同流式路径（见 handle_stream_request）
+    // 中途收尾后的重试按次数退避、按需降 effort，理由同流式路径（见 handle_stream_request）
     let mut attempt = 0u32;
     let call_upstream = move || {
         let delay = TRUNCATION_RETRY_BACKOFF * attempt;
+        let retry_body = effort_downgrade
+            .as_mut()
+            .and_then(|d| d.body_for_retry(attempt));
         attempt += 1;
         async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+            let body = retry_body.as_deref().unwrap_or(request_body);
             // 调用 Kiro API（支持多凭据故障转移）
-            provider.call_api(request_body, Some(sink), group).await
+            provider.call_api(body, Some(sink), group).await
         }
     };
     run_non_stream_request(
@@ -2326,10 +2403,12 @@ pub async fn post_messages_cc(
                 is_stream: false,
             },
         ));
+        let model = payload.model.clone();
+        let effort_downgrade = RetryEffortDowngrade::new(payload, state.tool_compatibility_mode);
         handle_non_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &model,
             total_input_tokens,
             extract_thinking,
             tool_name_map,
@@ -2338,6 +2417,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            effort_downgrade,
         )
         .await
     }
@@ -3635,5 +3715,77 @@ mod tests {
         assert!(matches!(result, Err(NonStreamExecutionError::Provider(_))));
         let overview = aggregator.overview();
         assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    /// Claude Code 形态的请求：adaptive thinking + 显式 effort，metadata 带固定会话 id
+    /// （否则每次转换的 conversationId 随机，没法比对请求体）。用户消息里故意放一段
+    /// 同名标签，确认降档不会误改用户内容。
+    fn effort_request(effort: &str) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "system": "You are a helpful assistant.",
+            "messages": [
+                { "role": "user", "content": "<thinking_effort>max</thinking_effort> 原样保留" }
+            ],
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": effort },
+            "metadata": {
+                "user_id": "user_x_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705"
+            }
+        }))
+        .unwrap()
+    }
+
+    /// 直接以给定 effort 转换出的请求体（期望值）
+    fn converted_body(effort: &str) -> String {
+        let conversion =
+            convert_request_with_mode(&effort_request(effort), ToolCompatibilityMode::Raw).unwrap();
+        serde_json::to_string(&KiroRequest {
+            conversation_state: conversion.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: conversion.additional_model_request_fields,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn retry_effort_downgrade_rebuilds_body_one_tier_lower_per_retry() {
+        let mut downgrade =
+            RetryEffortDowngrade::new(effort_request("max"), ToolCompatibilityMode::Raw)
+                .expect("max 应当降档");
+
+        assert_eq!(downgrade.body_for_retry(0), None, "首次请求沿用原请求体");
+        for (retry, effort) in [(1, "xhigh"), (2, "high"), (3, "high")] {
+            let body = downgrade.body_for_retry(retry).unwrap();
+            assert_eq!(body, converted_body(effort), "第 {retry} 次重试");
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                parsed["additionalModelRequestFields"]["output_config"]["effort"],
+                effort
+            );
+            assert!(
+                body.contains(&format!("<thinking_effort>{effort}</thinking_effort>")),
+                "thinking 前缀要一起降"
+            );
+            assert!(
+                body.contains("<thinking_effort>max</thinking_effort> 原样保留"),
+                "用户内容不能被改"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_effort_downgrade_only_for_effort_above_high() {
+        for effort in ["high", "medium", "low"] {
+            assert!(
+                RetryEffortDowngrade::new(effort_request(effort), ToolCompatibilityMode::Raw)
+                    .is_none(),
+                "{effort} 不需要降档"
+            );
+        }
+        let mut no_effort = effort_request("max");
+        no_effort.output_config = None;
+        assert!(RetryEffortDowngrade::new(no_effort, ToolCompatibilityMode::Raw).is_none());
     }
 }
