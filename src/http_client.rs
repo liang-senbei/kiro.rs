@@ -2,7 +2,7 @@
 //!
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
-use reqwest::{Client, Proxy};
+use reqwest::{Client, ClientBuilder, Proxy};
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -49,8 +49,38 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    finish_client(builder, proxy, tls_backend)
+}
 
+/// 上游模型调用 Client 的建连超时
+const STREAMING_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 上游模型调用 Client 的读空闲超时：等响应头、或响应体相邻两次读到数据之间最多等这么久。
+///
+/// 取原来的总超时值：以前能在总超时内完成的请求不受影响，一直在出数据的长输出不再被掐断。
+const STREAMING_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(720);
+
+/// 构建上游模型调用（generateAssistantResponse / MCP）用的 HTTP Client
+///
+/// 不设总超时：总超时包含读响应体的时间，长输出（effort=max 时常见数分钟）会在
+/// 生成途中被掐断。改为建连超时 + 读空闲超时，只有上游真的停住不动才算超时。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let builder = Client::builder()
+        .connect_timeout(STREAMING_CONNECT_TIMEOUT)
+        .read_timeout(STREAMING_READ_IDLE_TIMEOUT);
+    finish_client(builder, proxy, tls_backend)
+}
+
+/// 统一设置 TLS 后端与代理并构建 Client
+fn finish_client(
+    mut builder: ClientBuilder,
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
     match tls_backend {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
@@ -137,6 +167,13 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_streaming_client() {
+        assert!(build_streaming_client(None, TlsBackend::Rustls).is_ok());
+        let config = ProxyConfig::new("socks5://127.0.0.1:1080").with_auth("user", "pass");
+        assert!(build_streaming_client(Some(&config), TlsBackend::Rustls).is_ok());
     }
 
     #[test]
