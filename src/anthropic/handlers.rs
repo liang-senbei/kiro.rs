@@ -1490,56 +1490,58 @@ pub(crate) async fn execute_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Result<serde_json::Value, NonStreamExecutionError> {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
-            return Err(NonStreamExecutionError::Provider(e));
+    let provider = provider.as_ref();
+    let sink: &RequestTracer = &tracer;
+    let group = group.as_deref();
+    // 中途收尾后的重试按次数退避，理由同流式路径（见 handle_stream_request）
+    let mut attempt = 0u32;
+    let call_upstream = move || {
+        let delay = TRUNCATION_RETRY_BACKOFF * attempt;
+        attempt += 1;
+        async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            // 调用 Kiro API（支持多凭据故障转移）
+            provider.call_api(request_body, Some(sink), group).await
         }
     };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
+    run_non_stream_request(
+        call_upstream,
+        model,
+        input_tokens,
+        thinking_enabled,
+        &tool_name_map,
+        hook,
+        cache_usage,
+        &tracer,
+    )
+    .await
+}
 
-    // 读取响应体
-    let body_bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "interrupted",
-                Some(outcome::STREAM_INTERRUPTED),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
-            return Err(NonStreamExecutionError::Response(
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(ErrorResponse::new(
-                        "api_error",
-                        format!("读取响应失败: {}", e),
-                    )),
-                )
-                    .into_response(),
-            ));
-        }
-    };
+/// 一次上游非流式响应的解析结果
+struct NonStreamAttempt {
+    content: Vec<serde_json::Value>,
+    stop_reason: String,
+    context_input_tokens: Option<i32>,
+    provider_token_usage: Option<TokenUsage>,
+    credits: f64,
+    metering: Option<crate::kiro::model::events::MeteringEvent>,
+    tool_json_error: Option<super::stream::ToolJsonAccumulatorError>,
+    /// 上游中途收尾的原因（判定同流式路径）；不是中途收尾则为 None
+    truncation_reason: Option<&'static str>,
+}
 
+/// 解析一次上游非流式响应（AWS event-stream 字节）
+fn parse_non_stream_attempt(
+    body_bytes: &[u8],
+    model: &str,
+    thinking_enabled: bool,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) -> NonStreamAttempt {
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
+    if let Err(e) = decoder.feed(body_bytes) {
         tracing::warn!("缓冲区溢出: {}", e);
     }
 
@@ -1549,6 +1551,8 @@ pub(crate) async fn execute_non_stream_request(
     let mut native_redacted_thinking: Vec<String> = Vec::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
+    // 最后一个工具调用之后既没有 meteringEvent、也没有实质内容：参数可能被截断（同流式的 held_tool_uses）
+    let mut tools_unconfirmed = false;
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
@@ -1573,9 +1577,14 @@ pub(crate) async fn execute_non_stream_request(
                 if let Ok(event) = Event::from_frame(frame) {
                     match event {
                         Event::AssistantResponse(resp) => {
+                            // 工具调用之后还有实质内容：上游没在工具调用处收尾（纯空白不算）
+                            if !resp.content.trim().is_empty() {
+                                tools_unconfirmed = false;
+                            }
                             text_content.push_str(&resp.content);
                         }
                         Event::ReasoningContent(reasoning) => {
+                            tools_unconfirmed = false;
                             if let Some(text) = reasoning.text
                                 && !text.is_empty()
                             {
@@ -1594,9 +1603,10 @@ pub(crate) async fn execute_non_stream_request(
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
-                            match tool_accumulator.push(&tool_use, &tool_name_map) {
+                            match tool_accumulator.push(&tool_use, tool_name_map) {
                                 Ok(Some(completed)) => {
                                     tool_uses.push(completed.to_anthropic_block());
+                                    tools_unconfirmed = metering.is_none();
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
@@ -1646,6 +1656,8 @@ pub(crate) async fn execute_non_stream_request(
                                 "metering credits +{:.6}", event_metering.usage
                             );
                             metering = Some(event_metering);
+                            // 有 meteringEvent 说明上游正常结束了这次生成
+                            tools_unconfirmed = false;
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -1670,6 +1682,158 @@ pub(crate) async fn execute_non_stream_request(
         tracing::error!("{}", e);
         tool_json_error = Some(e);
     }
+
+    // 确定 stop_reason（上游显式给出的 max_tokens / 上下文满是真实终态，不按中途收尾处理）
+    let explicit_stop = stop_reason != "end_turn";
+    if has_tool_use && stop_reason == "end_turn" {
+        stop_reason = "tool_use".to_string();
+    }
+
+    // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
+    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
+
+    // 构建响应内容
+    let mut content = build_non_stream_content(
+        thinking_enabled,
+        text_content,
+        native_thinking,
+        native_thinking_signature,
+        native_redacted_thinking,
+    );
+    content.extend(tool_uses);
+
+    // 上游中途收尾的判定，与流式路径一致（见 StreamContext::truncation_reason）
+    let truncation_reason = if explicit_stop || tool_json_error.is_some() {
+        None
+    } else if thinking_enabled && is_thinking_only_content(&content) {
+        Some("上游只返回了 thinking，没有正文或工具调用")
+    } else if tools_unconfirmed {
+        Some("上游在工具调用后收尾且没有 meteringEvent，工具参数可能被截断")
+    } else {
+        None
+    };
+
+    NonStreamAttempt {
+        content,
+        stop_reason,
+        context_input_tokens,
+        provider_token_usage,
+        credits,
+        metering,
+        tool_json_error,
+        truncation_reason,
+    }
+}
+
+/// 内容里只有 thinking：没有非空白正文、也没有工具调用
+fn is_thinking_only_content(content: &[serde_json::Value]) -> bool {
+    content.iter().any(|block| block["type"] == "thinking")
+        && content.iter().all(|block| match block["type"].as_str() {
+            Some("thinking" | "redacted_thinking") => true,
+            Some("text") => block["text"].as_str().is_none_or(|t| t.trim().is_empty()),
+            _ => false,
+        })
+}
+
+/// 执行非流式请求：上游中途收尾（判定同流式路径）时透明重试，重试用尽回 529 overloaded_error。
+/// `call_upstream` 每调用一次发起一次上游请求（含退避），便于测试注入伪造的上游响应。
+#[allow(clippy::too_many_arguments)]
+async fn run_non_stream_request<F, Fut>(
+    mut call_upstream: F,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: &std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: &RequestTracer,
+) -> Result<serde_json::Value, NonStreamExecutionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<crate::kiro::provider::KiroCallResult>>,
+{
+    let mut retries = 0u32;
+    // 被重试掉的那几次上游响应已计的 credits（只有 thinking 的回合也可能下发 meteringEvent）
+    let mut retried_credits: f64 = 0.0;
+    let (credential_id, parsed) = loop {
+        let call_result = match call_upstream().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                hook.record(0, input_tokens, 0, 0, 0, retried_credits, "error");
+                tracer.finalize(
+                    "error",
+                    last_attempt_outcome(tracer),
+                    Some(&e.to_string()),
+                    None,
+                    TraceUsage::zero(),
+                );
+                return Err(NonStreamExecutionError::Provider(e));
+            }
+        };
+        let credential_id = call_result.credential_id;
+
+        // 读取响应体
+        let body_bytes = match call_result.response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("读取响应体失败: {}", e);
+                hook.record(
+                    credential_id,
+                    input_tokens,
+                    0,
+                    0,
+                    0,
+                    retried_credits,
+                    "error",
+                );
+                tracer.finalize(
+                    "interrupted",
+                    Some(outcome::STREAM_INTERRUPTED),
+                    Some(&e.to_string()),
+                    None,
+                    TraceUsage::zero(),
+                );
+                return Err(NonStreamExecutionError::Response(
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorResponse::new(
+                            "api_error",
+                            format!("读取响应失败: {}", e),
+                        )),
+                    )
+                        .into_response(),
+                ));
+            }
+        };
+
+        let parsed = parse_non_stream_attempt(&body_bytes, model, thinking_enabled, tool_name_map);
+        if let Some(reason) = parsed.truncation_reason
+            && retries < TRUNCATION_MAX_RETRIES
+        {
+            retries += 1;
+            retried_credits += parsed.credits;
+            tracing::warn!(
+                attempt = retries,
+                credits = parsed.credits,
+                "{}，透明重试",
+                reason
+            );
+            continue;
+        }
+        break (credential_id, parsed);
+    };
+    let NonStreamAttempt {
+        content,
+        stop_reason,
+        context_input_tokens,
+        provider_token_usage,
+        credits,
+        metering,
+        tool_json_error,
+        truncation_reason,
+    } = parsed;
+    // 计费按真实消耗：被重试掉的几次也算
+    let credits = credits + retried_credits;
 
     // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
     // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
@@ -1725,24 +1889,6 @@ pub(crate) async fn execute_non_stream_request(
         ));
     }
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
-    }
-
-    // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
-    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
-
-    // 构建响应内容
-    let mut content = build_non_stream_content(
-        thinking_enabled,
-        text_content,
-        native_thinking,
-        native_thinking_signature,
-        native_redacted_thinking,
-    );
-    content.extend(tool_uses);
-
     // provider 未下发 metadataEvent 时才使用本地输出估算。
     let fallback_output_tokens = token::estimate_output_tokens(&content);
     let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
@@ -1753,6 +1899,54 @@ pub(crate) async fn execute_non_stream_request(
             cache_usage,
             provider_token_usage,
         );
+    let trace_usage = TraceUsage {
+        input_tokens: final_input_tokens.max(0) as u64,
+        output_tokens: output_tokens.max(0) as u64,
+        cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+        cache_read_tokens: cache_read_tokens.max(0) as u64,
+        credits: if credits.is_finite() && credits > 0.0 {
+            credits
+        } else {
+            0.0
+        },
+        source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
+    };
+
+    // 重试用尽仍是上游中途收尾：空的 thinking 回合 / 可能半截的工具调用都不能当成正常结果返回。
+    // 回 529 overloaded_error（Anthropic 自己过载时用的状态码），客户端会当成临时故障处理。
+    if let Some(reason) = truncation_reason {
+        let message = format!("{}（透明重试 {} 次）", reason, retries);
+        tracing::warn!(credits, "{}", message);
+        hook.record(
+            credential_id,
+            final_input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            credits,
+            "error",
+        );
+        tracer.finalize(
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some(&message),
+            None,
+            trace_usage,
+        );
+        return Err(NonStreamExecutionError::Response(
+            (
+                StatusCode::from_u16(529).unwrap(),
+                Json(ErrorResponse::new(
+                    super::stream::TRUNCATION_ERROR_TYPE,
+                    super::stream::TRUNCATION_ERROR_MESSAGE,
+                )),
+            )
+                .into_response(),
+        ));
+    }
+    if retries > 0 {
+        tracing::info!(retries, "透明重试后拿到了完整响应");
+    }
 
     // 构建 Anthropic 响应
     let mut usage_json = json!({
@@ -1788,24 +1982,7 @@ pub(crate) async fn execute_non_stream_request(
         credits,
         "success",
     );
-    tracer.finalize(
-        "success",
-        None,
-        None,
-        None,
-        TraceUsage {
-            input_tokens: final_input_tokens.max(0) as u64,
-            output_tokens: output_tokens.max(0) as u64,
-            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
-            cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 {
-                credits
-            } else {
-                0.0
-            },
-            source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
-        },
-    );
+    tracer.finalize("success", None, None, None, trace_usage);
     Ok(response_body)
 }
 
@@ -3237,5 +3414,226 @@ mod tests {
         let (_, delta) = events.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
         assert_eq!(events.last().unwrap().0, "message_stop");
+    }
+
+    // ---- 非流式路径：上游中途收尾时透明重试（判定同流式） ----
+
+    /// 以启用 thinking 的上下文跑一次非流式请求；`responses` 依次作为每次上游调用的结果。
+    /// 返回结果、上游调用次数（含首次）、用量聚合器
+    async fn run_non_stream(
+        mut responses: Vec<anyhow::Result<crate::kiro::provider::KiroCallResult>>,
+    ) -> (
+        Result<serde_json::Value, NonStreamExecutionError>,
+        usize,
+        std::sync::Arc<crate::admin::usage_stats::UsageAggregator>,
+    ) {
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
+            None,
+            None,
+            Some(aggregator.clone()),
+        );
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        let tracer = RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 0,
+                    group: None,
+                    key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
+                },
+                model: "test-model".to_string(),
+                is_stream: false,
+            },
+        );
+        let mut calls = 0usize;
+        responses.reverse();
+        let result = run_non_stream_request(
+            || {
+                calls += 1;
+                let next = responses.pop().expect("上游调用次数超出预期");
+                async move { next }
+            },
+            "test-model",
+            11,
+            true,
+            &std::collections::HashMap::new(),
+            hook,
+            super::super::cache_metering::CacheUsage::default(),
+            &tracer,
+        )
+        .await;
+        (result, calls, aggregator)
+    }
+
+    fn expect_non_stream_ok(
+        result: Result<serde_json::Value, NonStreamExecutionError>,
+    ) -> serde_json::Value {
+        match result {
+            Ok(body) => body,
+            Err(NonStreamExecutionError::Provider(e)) => panic!("意外的 provider 错误: {e}"),
+            Err(NonStreamExecutionError::Response(r)) => panic!("意外的错误响应: {}", r.status()),
+        }
+    }
+
+    async fn expect_non_stream_error_response(
+        result: Result<serde_json::Value, NonStreamExecutionError>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = match result {
+            Err(NonStreamExecutionError::Response(r)) => r,
+            Ok(body) => panic!("应当失败，却返回了: {body}"),
+            Err(NonStreamExecutionError::Provider(e)) => panic!("意外的 provider 错误: {e}"),
+        };
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn non_stream_tool_use_ids(body: &serde_json::Value) -> Vec<String> {
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .map(|block| block["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn thinking_only_non_stream_is_retried_transparently() {
+        // 第一次只有 thinking（上游仍下发了 meteringEvent），第二次有正文
+        let (result, calls, aggregator) = run_non_stream(vec![
+            Ok(upstream_frames(vec![
+                assistant_frame("<thinking>\nabc</thinking>"),
+                metering_frame(),
+            ])),
+            Ok(upstream_frames(vec![
+                assistant_frame("<thinking>\ndef</thinking>\n\nHello"),
+                metering_frame(),
+            ])),
+        ])
+        .await;
+        let body = expect_non_stream_ok(result);
+
+        assert_eq!(calls, 2, "只应重试一次");
+        let content = body["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "重试掉的那次不能出现在响应里: {body}");
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "def");
+        assert_eq!(content[1]["text"], "Hello");
+        assert_eq!(body["stop_reason"], "end_turn");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 0));
+        assert!(
+            (overview.today_credits - 0.2).abs() < 1e-9,
+            "被重试掉的那次也要计费: {}",
+            overview.today_credits
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_only_non_stream_ends_with_overloaded_error_after_retries() {
+        let only_thinking = || Ok(upstream_call(&["<thinking>\nabc</thinking>"]));
+        let (result, calls, aggregator) =
+            run_non_stream(vec![only_thinking(), only_thinking(), only_thinking()]).await;
+        let (status, body) = expect_non_stream_error_response(result).await;
+
+        assert_eq!(calls, 1 + TRUNCATION_MAX_RETRIES as usize);
+        assert_eq!(status.as_u16(), 529);
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn tool_call_without_metering_non_stream_is_retried_transparently() {
+        let (result, calls, aggregator) = run_non_stream(vec![
+            Ok(upstream_frames(vec![
+                assistant_frame("I'll run it."),
+                tool_use_frame("tooluse_a", "Bash", r#"{"command":"cat <<EOF > a.txt"}"#),
+            ])),
+            Ok(upstream_frames(vec![
+                assistant_frame("Running."),
+                tool_use_frame("tooluse_b", "Bash", r#"{"command":"ls"}"#),
+                metering_frame(),
+            ])),
+        ])
+        .await;
+        let body = expect_non_stream_ok(result);
+
+        assert_eq!(calls, 2, "只应重试一次");
+        assert_eq!(
+            non_stream_tool_use_ids(&body),
+            vec!["tooluse_b"],
+            "截断那次的工具调用不能发给客户端"
+        );
+        assert_eq!(body["stop_reason"], "tool_use");
+        assert_eq!(body["usage"]["credit_usage"], 0.1);
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn tool_call_without_metering_non_stream_ends_with_overloaded_error_after_retries() {
+        let truncated = || {
+            Ok(upstream_frames(vec![tool_use_frame(
+                "tooluse_a",
+                "Bash",
+                r#"{"command":"cat <<EOF > a.txt"}"#,
+            )]))
+        };
+        let (result, calls, aggregator) =
+            run_non_stream(vec![truncated(), truncated(), truncated()]).await;
+        let (status, body) = expect_non_stream_error_response(result).await;
+
+        assert_eq!(calls, 1 + TRUNCATION_MAX_RETRIES as usize);
+        assert_eq!(status.as_u16(), 529);
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn tool_call_with_metering_non_stream_is_not_retried() {
+        let (result, calls, _) = run_non_stream(vec![Ok(upstream_frames(vec![
+            tool_use_frame("tooluse_a", "Bash", r#"{"command":"ls"}"#),
+            metering_frame(),
+        ]))])
+        .await;
+        let body = expect_non_stream_ok(result);
+
+        assert_eq!(calls, 1);
+        assert_eq!(non_stream_tool_use_ids(&body), vec!["tooluse_a"]);
+        assert_eq!(body["stop_reason"], "tool_use");
+    }
+
+    #[tokio::test]
+    async fn text_non_stream_is_not_retried() {
+        let (result, calls, _) = run_non_stream(vec![Ok(upstream_call(&[
+            "<thinking>\nabc</thinking>\n\nHello",
+        ]))])
+        .await;
+        let body = expect_non_stream_ok(result);
+
+        assert_eq!(calls, 1);
+        assert_eq!(body["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn non_stream_retry_request_failure_is_reported_as_provider_error() {
+        // 非流式还没给客户端写过任何字节：重试请求本身失败按首次失败处理（交给 map_provider_error）
+        let (result, calls, aggregator) = run_non_stream(vec![
+            Ok(upstream_call(&["<thinking>\nabc</thinking>"])),
+            Err(anyhow::anyhow!("all credentials exhausted")),
+        ])
+        .await;
+
+        assert_eq!(calls, 2);
+        assert!(matches!(result, Err(NonStreamExecutionError::Provider(_))));
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
     }
 }
