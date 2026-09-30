@@ -1158,6 +1158,21 @@ fn sse_bytes(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>> {
         .collect()
 }
 
+/// 错误及其完整 source 链，用 `: ` 连接（日志 / 结算记录用）。
+///
+/// reqwest 的 Display 只有一句 "error decoding response body" 之类的概括，真正的原因
+/// （连接被重置、HTTP/2 流被取消、读空闲超时）在 source 链里，不展开就看不到。
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// 解析一个上游帧。没有转成 [`Event`] 的帧（未知事件类型 / 解析失败）返回其类型，
 /// 由调用方记进诊断信息——以前这类帧被静默丢弃，出问题时日志里什么都看不到。
 fn decode_kiro_frame(frame: crate::kiro::parser::frame::Frame) -> Result<Event, String> {
@@ -1225,7 +1240,7 @@ fn create_sse_stream(
                             }
                             Err(e) => {
                                 let cause = retry.as_ref().map_or("上游中途收尾", |r| r.last_reason);
-                                let reason = format!("{}，透明重试请求失败: {}", cause, e);
+                                let reason = format!("{}，透明重试请求失败: {:#}", cause, e);
                                 let final_events = ctx.truncation_error_events(reason.clone());
                                 settlement.update(&ctx, sent_bytes);
                                 settlement.finish(
@@ -1287,27 +1302,55 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            let cause = error_chain(&e);
+                            // 读上游响应体出错（连接被重置、HTTP/2 流被取消、读空闲超时）：客户端
+                            // 只收到过 thinking 时还有重试次数就透明重试；缓冲里没发出去的内容可能是
+                            // 半截的，不 flush，由 prepare_truncation_retry 丢弃
+                            let read_error_retryable = ctx.is_retryable_read_error();
+                            if read_error_retryable
+                                && let Some(r) = retry.as_mut().filter(|r| r.remaining > 0)
+                            {
+                                r.remaining -= 1;
+                                r.attempts += 1;
+                                r.last_reason = "读取上游响应流失败";
+                                tracing::warn!(
+                                    attempt = r.attempts,
+                                    credits = ctx.credits,
+                                    output_tokens = ctx.output_tokens,
+                                    "读取上游响应流失败，透明重试: {}",
+                                    cause
+                                );
+                                let events = ctx.prepare_truncation_retry();
+                                r.in_flight = Some((r.start)());
+                                settlement.update(&ctx, sent_bytes);
+                                return Some((stream::iter(sse_bytes(events)), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
+                            }
+                            let retried = retry.as_ref().map_or(0, |r| r.attempts);
+                            tracing::error!(retried, "读取上游响应流失败: {}", cause);
                             // 流已开始后无法修改 HTTP 状态码。关闭已打开的内容块并发送
                             // Anthropic error 终态，不能用正常 message_stop 掩盖上游断流。
+                            // 客户端只收到过 thinking：按上游中途收尾处理，发 overloaded_error 让
+                            // 客户端当成临时故障自行重试；已有正文 / 工具调用则如实报断流。
+                            let error_type = if read_error_retryable {
+                                super::stream::TRUNCATION_ERROR_TYPE
+                            } else {
+                                "upstream_error"
+                            };
                             let final_events = ctx.generate_error_events(
-                                "upstream_error",
+                                error_type,
                                 "Upstream response stream was interrupted",
                             );
                             settlement.update(&ctx, sent_bytes);
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
+                            let message = format!("读取上游响应流失败: {}（透明重试 {} 次）", cause, retried);
                             settlement.finish(
                                 "error",
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
-                                Some(&e.to_string()),
+                                Some(&message),
                                 Some(sent_bytes),
                             );
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
+                            Some((stream::iter(sse_bytes(final_events)), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
                         }
                         None => {
                             // 上游中途收尾：还有重试次数就在同一条流里透明重试
@@ -1852,8 +1895,20 @@ where
         // 读取响应体
         let body_bytes = match call_result.response.bytes().await {
             Ok(bytes) => bytes,
+            // 连接被重置、HTTP/2 流被取消、读空闲超时等：非流式还没给客户端写过任何字节，可以重试
+            Err(e) if retries < TRUNCATION_MAX_RETRIES => {
+                retries += 1;
+                tracing::warn!(
+                    attempt = retries,
+                    "读取上游响应体失败，透明重试: {}",
+                    error_chain(&e)
+                );
+                continue;
+            }
             Err(e) => {
-                tracing::error!("读取响应体失败: {}", e);
+                let cause = error_chain(&e);
+                tracing::error!(retried = retries, "读取上游响应体失败: {}", cause);
+                let message = format!("读取上游响应体失败: {}（透明重试 {} 次）", cause, retries);
                 hook.record(
                     credential_id,
                     input_tokens,
@@ -1866,7 +1921,7 @@ where
                 tracer.finalize(
                     "interrupted",
                     Some(outcome::STREAM_INTERRUPTED),
-                    Some(&e.to_string()),
+                    Some(&message),
                     None,
                     TraceUsage::zero(),
                 );
@@ -2556,7 +2611,8 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
+                                let cause = error_chain(&e);
+                                tracing::error!("读取上游响应流失败: {}", cause);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
@@ -2565,7 +2621,7 @@ fn create_buffered_sse_stream(
                                 tracer.finalize(
                                     "interrupted",
                                     Some(outcome::STREAM_INTERRUPTED),
-                                    Some(&e.to_string()),
+                                    Some(&cause),
                                     Some(sent_bytes),
                                     TraceUsage {
                                         input_tokens: i.max(0) as u64,
@@ -3715,6 +3771,163 @@ mod tests {
         assert!(matches!(result, Err(NonStreamExecutionError::Provider(_))));
         let overview = aggregator.overview();
         assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    // ---- 读上游响应体出错（连接被重置等）：客户端只收到过 thinking 时透明重试 ----
+
+    /// 模拟一次上游响应：先下发给定的原始帧，然后连接被重置
+    fn upstream_frames_then_reset(frames: Vec<Vec<u8>>) -> crate::kiro::provider::KiroCallResult {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(frames.concat())),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        ];
+        let body = reqwest::Body::wrap_stream(stream::iter(chunks));
+        crate::kiro::provider::KiroCallResult {
+            response: reqwest::Response::from(http::Response::new(body)),
+            credential_id: 42,
+        }
+    }
+
+    fn block_start_stop_counts(events: &[(String, serde_json::Value)]) -> (usize, usize) {
+        let count = |kind: &str| events.iter().filter(|(e, _)| e == kind).count();
+        (count("content_block_start"), count("content_block_stop"))
+    }
+
+    #[tokio::test]
+    async fn stream_read_error_before_content_is_retried_transparently() {
+        let (events, calls, aggregator) = run_thinking_stream(
+            upstream_frames_then_reset(vec![assistant_frame("<thinking>\nabc</thinking>")]),
+            vec![Ok(upstream_call(&[
+                "<thinking>\ndef</thinking>\n\n",
+                "Hello",
+            ]))],
+        )
+        .await;
+
+        assert_eq!(calls, 1, "只应重试一次");
+        assert!(
+            !events.iter().any(|(e, _)| e == "error"),
+            "不应报错: {:?}",
+            events
+        );
+        let text_blocks = block_starts(&events)
+            .into_iter()
+            .filter(|(kind, _)| kind == "text")
+            .count();
+        assert_eq!(text_blocks, 1, "正文只来自重试那次: {:?}", events);
+        let (starts, stops) = block_start_stop_counts(&events);
+        assert_eq!(starts, stops, "每个块都要关闭");
+        let (_, delta) = events.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events.last().unwrap().0, "message_stop");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn stream_read_error_ends_with_overloaded_error_after_retries() {
+        let broken =
+            || upstream_frames_then_reset(vec![assistant_frame("<thinking>\nabc</thinking>")]);
+        let (events, calls, aggregator) =
+            run_thinking_stream(broken(), vec![Ok(broken()), Ok(broken())]).await;
+
+        assert_eq!(calls, TRUNCATION_MAX_RETRIES as usize);
+        let (last_event, last_data) = events.last().unwrap();
+        assert_eq!(last_event, "error");
+        assert_eq!(last_data["error"]["type"], "overloaded_error");
+        assert!(
+            !last_data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reset"),
+            "底层错误细节不应透传给客户端"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(e, _)| e == "message_delta" || e == "message_stop")
+        );
+        let (starts, stops) = block_start_stop_counts(&events);
+        assert_eq!(starts, stops, "每个块都要关闭");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn stream_read_error_after_text_is_not_retried() {
+        // 正文已经发给客户端，重试会让它重复，只能如实报断流
+        let (events, calls, aggregator) = run_thinking_stream(
+            upstream_frames_then_reset(vec![assistant_frame(
+                "<thinking>\nabc</thinking>\n\nHello, this answer is already on its way to the client.",
+            )]),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(calls, 0);
+        assert!(
+            block_starts(&events).iter().any(|(kind, _)| kind == "text"),
+            "前提：断流前正文块已发出: {:?}",
+            events
+        );
+        let (last_event, last_data) = events.last().unwrap();
+        assert_eq!(last_event, "error");
+        assert_eq!(last_data["error"]["type"], "upstream_error");
+        assert!(!events.iter().any(|(e, _)| e == "message_stop"));
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn non_stream_read_error_is_retried_transparently() {
+        // 非流式还没给客户端写过任何字节，读响应体失败可以直接重试
+        let (result, calls, aggregator) = run_non_stream(vec![
+            Ok(upstream_frames_then_reset(vec![assistant_frame(
+                "<thinking>\nabc",
+            )])),
+            Ok(upstream_frames(vec![
+                assistant_frame("<thinking>\ndef</thinking>\n\nHello"),
+                metering_frame(),
+            ])),
+        ])
+        .await;
+        let body = expect_non_stream_ok(result);
+
+        assert_eq!(calls, 2, "只应重试一次");
+        let content = body["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "断掉的那次不能出现在响应里: {body}");
+        assert_eq!(content[1]["text"], "Hello");
+        assert_eq!(body["stop_reason"], "end_turn");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn non_stream_read_error_returns_bad_gateway_after_retries() {
+        let broken = || Ok(upstream_frames_then_reset(vec![assistant_frame("Hel")]));
+        let (result, calls, aggregator) = run_non_stream(vec![broken(), broken(), broken()]).await;
+        let (status, body) = expect_non_stream_error_response(result).await;
+
+        assert_eq!(calls, TRUNCATION_MAX_RETRIES as usize + 1);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["type"], "api_error");
+        let overview = aggregator.overview();
+        assert_eq!((overview.today_calls, overview.today_errors), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn error_chain_includes_root_cause() {
+        let e = upstream_frames_then_reset(Vec::new())
+            .response
+            .bytes()
+            .await
+            .expect_err("响应体应当读取失败");
+        let chain = error_chain(&e);
+        assert!(chain.starts_with(&e.to_string()), "{chain}");
+        assert!(chain.contains("connection reset by peer"), "{chain}");
     }
 
     /// Claude Code 形态的请求：adaptive thinking + 显式 effort，metadata 带固定会话 id

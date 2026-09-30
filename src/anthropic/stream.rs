@@ -2650,6 +2650,18 @@ impl StreamContext {
         self.truncation_reason().is_some() && self.tool_block_indices.is_empty()
     }
 
+    /// 读上游响应体出错（连接被重置、HTTP/2 流被取消、读空闲超时等）时，能否在同一条流里透明重试。
+    ///
+    /// 客户端只收到过 thinking 才可以：正文 / 工具调用已经发出去就撤不回，重试会让它们重复。
+    /// 还在缓冲里、没发出去的内容可能是半截的，由 [`Self::prepare_truncation_retry`] 直接丢弃。
+    /// 工具参数 JSON 已经解析失败的也不重试：那是内容问题，而且 `prepare_truncation_retry`
+    /// 不复位该错误和随之设置的 stop_reason。
+    pub fn is_retryable_read_error(&self) -> bool {
+        !self.state_manager.has_non_thinking_blocks()
+            && self.tool_block_indices.is_empty()
+            && self.tool_json_error.is_none()
+    }
+
     /// 为透明重试做准备：关闭已发出的 thinking / 正文块、丢弃扣住的工具调用并重置本段解析状态，
     /// 让下一次上游响应的内容作为新的内容块接在后面（块索引继续递增）。
     ///
