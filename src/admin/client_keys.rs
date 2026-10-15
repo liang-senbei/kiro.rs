@@ -148,6 +148,11 @@ impl ClientKeyManager {
         }
     }
 
+    /// 按 id 取单个 Key（含明文）
+    pub fn get(&self, id: u64) -> Option<ClientKey> {
+        self.inner.read().entries.get(&id).cloned()
+    }
+
     /// 列表（按 id 升序）
     pub fn list(&self) -> Vec<ClientKey> {
         let inner = self.inner.read();
@@ -602,6 +607,19 @@ mod tests {
         assert!(entry.key.starts_with("sk-"));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         assert_eq!(mgr.verify_and_touch("nope"), None);
+    }
+
+    #[test]
+    fn get_returns_current_plaintext() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, Some("team".to_string()));
+        let got = mgr.get(entry.id).unwrap();
+        assert_eq!(got.key, entry.key);
+        assert_eq!(got.group.as_deref(), Some("team"));
+
+        let rotated = mgr.rotate(entry.id).unwrap();
+        assert_eq!(mgr.get(entry.id).unwrap().key, rotated.key, "轮换后返回新明文");
+        assert!(mgr.get(entry.id + 100).is_none());
     }
 
     #[test]

@@ -321,6 +321,7 @@ codex
 | `/api/admin/models` | 使用账号池当前选中的可用凭据实时查询模型 |
 | `/api/admin/models/test` | 对指定模型发送真实的最小化请求并返回响应、耗时和 credit |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
+| `/api/admin/client-keys/{id}/export` | 取回明文 Key 用于导出配置（POST，`no-store`） |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
@@ -799,8 +800,22 @@ JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退
 
 - 概览：整体请求量、token、模型分布、凭据贡献。
 - 凭据管理：添加、登录、重登、删除、禁用、优先级、余额、模型列表、超额开关、代理绑定。
-- 客户端 Key：创建、编辑、禁用、轮换、删除、分组绑定和重置统计；系统 Key 不可删除但可轮换。
+- 客户端 Key：创建、编辑、禁用、轮换、删除、分组绑定和重置统计；系统 Key 不可删除但可轮换。每把 Key 都可以「导出配置」，见下文。
 - 请求日志：查询 `traces.db`，查看失败原因、状态码、凭据尝试链路和 token 用量。
+
+### 导出客户端 Key：直接使用 / CC Switch
+
+客户端 Key 列表每行的分享按钮、Key 下拉菜单，以及新建 / 轮换后的弹窗里都有「导出配置」。弹窗先填两项：
+
+- **服务地址**：客户端访问本服务的地址，默认取当前页面地址。经反向代理或域名对外提供时改成对外地址，浏览器会记住它。本机 / 内网地址会有提示。
+- **端点**：标准端点（推荐，实时流式，上游中途收尾时透明重试），或 `/cc` 兼容端点。
+
+两种导出方式：
+
+- **直接使用**：给出 Claude Code 的 `~/.claude/settings.json` 片段、macOS / Linux 与 PowerShell 的环境变量、连通性测试 `curl`，以及 Anthropic / OpenAI 兼容客户端的 base URL。只设置 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，不设置 `ANTHROPIC_API_KEY`（两者同时存在时 Claude Code 会提示凭证冲突）。
+- **CC Switch 导入**：一键唤起 [CC Switch](https://ccswitch.io)，导入为 Claude Code 供应商，接口格式 Anthropic 原生（`apiFormat=anthropic`），Claude Code 直连本服务，不需要 CC Switch 本地路由；模型留空，沿用 Claude Code 自带的模型列表。链接形如 `ccswitch://v1/import?resource=provider&app=claude&name=…&endpoint=…&apiKey=…&apiFormat=anthropic`，也可以复制后发给 Key 的使用者自己点开。建议 CC Switch v4.0.10 及以上。
+
+导出时 Admin UI 通过 `POST /api/admin/client-keys/{id}/export` 取回明文 Key（响应带 `Cache-Control: no-store`）。导入链接和配置片段都带着明文 Key，只发给这把 Key 的使用者。
 
 Admin 还提供：
 

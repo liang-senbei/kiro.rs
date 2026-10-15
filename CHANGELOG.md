@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-主题：**合并 upstream master、多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复**。
+主题：**合并 upstream master、多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复，以及客户端 Key 一键导出（直接使用 / CC Switch）**。
 
 ### 🔀 合并 upstream（ZyphrZero/kiro.rs master @ `8cbd7fa`）
 
@@ -20,6 +20,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 账号级 429 故障转移（upstream 981aa7a）：`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED`、suspicious activity、`5-minute credit limit exceeded` 等会冷却当前凭据（`accountThrottleCooldownSecs`，默认 1800 秒）并换号。`USER_REQUEST_RATE_EXCEEDED` 仍走本 fork 的突发限流排队，判断排在账号级冷却之前，不会被冷却 30 分钟。新增 `modelApi429RetryEnabled`。
 - `contextUsage` 回退计量扣除本轮输出（upstream 700fbdb / baacf84）：透明重试时只扣最后一次上游响应自己的输出，不扣被重试掉的那几次累计的输出；结算的输出 token 仍是全部尝试之和。
 - 其余 upstream 改动：月度额度恢复、Codex 会话 ID 计量、CacheMeter 容量可配置、WebSearch 跨轮缓存计量与 credits 累计、Admin 命中率计入缓存写入、上游响应头到达前被取消的请求写入 trace 等。
+
+### 📤 客户端 Key 导出
+
+- 客户端 Key 页新增「导出配置」（行内分享按钮、Key 下拉菜单、新建 / 轮换后的弹窗）：
+  - **直接使用**：Claude Code `settings.json` 片段、macOS / Linux 与 PowerShell 环境变量、`curl` 连通性测试，以及 Anthropic / OpenAI 兼容 base URL。
+  - **CC Switch 导入**：生成 `ccswitch://v1/import` 深链接，导入为 Claude Code 供应商、Anthropic 原生格式（`apiFormat=anthropic`），一键唤起 CC Switch 或复制链接发给使用者。
+- 服务地址默认取当前页面地址，可改成对外地址并被记住；本机 / 内网地址会提示。可选标准端点或 `/cc` 兼容端点。
+- 新增 `POST /api/admin/client-keys/{id}/export`，返回明文 Key（`Cache-Control: no-store`）。明文 Key 不再只在创建 / 轮换时可见，新建弹窗的提示文案随之更新。
 
 ### 🚦 账号突发限流（`USER_REQUEST_RATE_EXCEEDED`）
 
