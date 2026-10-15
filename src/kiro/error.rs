@@ -14,6 +14,35 @@ pub struct UpstreamRateLimitError {
 #[error("upstream context window exceeded")]
 pub struct UpstreamContextOverflowError;
 
+/// Kiro rejected the request itself with a 4xx other than 429 (for example
+/// `400 Improperly formed request`). Sending the same body again cannot succeed,
+/// so it must reach the client as a client error: a 502 makes Claude Code and the
+/// SDKs retry it several times and report it as an upstream outage.
+///
+/// `Display` keeps the provider's original `"<kind> API 请求失败: <status> <body>"`
+/// text so the string-based classifiers in `map_provider_error` still see the body.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{api_type} API 请求失败: {status} {body}")]
+pub struct UpstreamClientError {
+    api_type: &'static str,
+    status: http::StatusCode,
+    body: String,
+}
+
+impl UpstreamClientError {
+    pub(crate) fn new(api_type: &'static str, status: http::StatusCode, body: String) -> Self {
+        Self {
+            api_type,
+            status,
+            body,
+        }
+    }
+
+    pub fn status(&self) -> http::StatusCode {
+        self.status
+    }
+}
+
 impl UpstreamRateLimitError {
     pub(crate) fn new(retry_after: Option<String>) -> Self {
         Self {
@@ -66,6 +95,20 @@ mod tests {
         let http_date = UpstreamRateLimitError::new(Some(date.to_string()));
         assert_eq!(http_date.retry_after(), Some(date));
         assert!(!http_date.should_retry_locally());
+    }
+
+    #[test]
+    fn client_error_display_keeps_provider_text() {
+        let error = UpstreamClientError::new(
+            "流式",
+            http::StatusCode::BAD_REQUEST,
+            r#"{"message":"Improperly formed request.","reason":null}"#.to_string(),
+        );
+        assert_eq!(error.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.to_string(),
+            r#"流式 API 请求失败: 400 Bad Request {"message":"Improperly formed request.","reason":null}"#
+        );
     }
 
     #[test]

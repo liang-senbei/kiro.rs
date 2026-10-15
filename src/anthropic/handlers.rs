@@ -457,6 +457,28 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // 上游以 4xx（非 429）拒绝了请求本身：同一个请求重发不会成功。回 4xx 让客户端停止
+    // 重试；回 502 会让 Claude Code / SDK 连续重试多次并显示为上游故障。
+    // 原始报文只进日志，不回显给客户端。
+    if let Some(client_error) = err.downcast_ref::<crate::kiro::error::UpstreamClientError>() {
+        tracing::warn!(error = %err, "上游拒绝了请求（映射为客户端错误，不应重试）");
+        let (status, error_type) = match client_error.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => (StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+            _ => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        };
+        return (
+            status,
+            Json(ErrorResponse::new(
+                error_type,
+                format!(
+                    "Upstream rejected the request (HTTP {}). Resending the same request will not help; see the proxy log for details.",
+                    client_error.status().as_u16()
+                ),
+            )),
+        )
+            .into_response();
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -2971,6 +2993,61 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Context window is full"));
+    }
+
+    #[tokio::test]
+    async fn upstream_client_error_maps_to_400_without_echoing_body() {
+        let secret = r#"{"message":"Improperly formed request.","requestId":"private-request"}"#;
+        let err = crate::kiro::error::UpstreamClientError::new(
+            "流式",
+            StatusCode::BAD_REQUEST,
+            secret.to_string(),
+        );
+        let resp = map_provider_error(err.into());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("HTTP 400"), "{message}");
+        assert!(!message.contains("private-request"), "{message}");
+    }
+
+    #[test]
+    fn upstream_client_error_keeps_specific_mappings() {
+        // 413 保留为 request_too_large
+        let resp = map_provider_error(
+            crate::kiro::error::UpstreamClientError::new(
+                "非流式",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                String::new(),
+            )
+            .into(),
+        );
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 按报文识别的分支（输入过长、客户端校验）仍优先命中
+        let resp = map_provider_error(
+            crate::kiro::error::UpstreamClientError::new(
+                "流式",
+                StatusCode::BAD_REQUEST,
+                r#"{"message":"Input is too long."}"#.to_string(),
+            )
+            .into(),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = map_provider_error(
+            crate::kiro::error::UpstreamClientError::new(
+                "流式",
+                StatusCode::BAD_REQUEST,
+                r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#.to_string(),
+            )
+            .into(),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

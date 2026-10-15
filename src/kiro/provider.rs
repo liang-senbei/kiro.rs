@@ -15,7 +15,9 @@ use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, trunc
 use crate::http_client::{ProxyConfig, build_streaming_client};
 use crate::kiro::burst_pacer::BurstPacer;
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::{UpstreamContextOverflowError, UpstreamRateLimitError};
+use crate::kiro::error::{
+    UpstreamClientError, UpstreamContextOverflowError, UpstreamRateLimitError,
+};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -1023,7 +1025,7 @@ impl KiroProvider {
                 if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
                     return Err(UpstreamContextOverflowError.into());
                 }
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamClientError::new(api_type, status, body).into());
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -1284,7 +1286,7 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamClientError::new(api_type, status, body).into());
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
