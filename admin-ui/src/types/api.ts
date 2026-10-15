@@ -478,7 +478,7 @@ export interface CreateClientKeyRequest {
   maxCredits?: number
 }
 
-/** 创建响应：明文 Key 仅在此处返回一次 */
+/** 创建 / 轮换响应：明文 Key（之后可经导出接口再次取回） */
 export interface CreateClientKeyResponse {
   id: number
   key: string
@@ -489,6 +489,15 @@ export interface CreateClientKeyResponse {
 export interface UpdateClientKeyRequest {
   name?: string
   description?: string
+  group?: string
+}
+
+/** 导出响应：明文 Key，用于生成直接使用配置与 CC Switch 导入链接 */
+export interface ExportClientKeyResponse {
+  id: number
+  key: string
+  name: string
+  disabled: boolean
   group?: string
 }
 

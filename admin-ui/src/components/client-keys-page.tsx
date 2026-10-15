@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Loader2,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Loader2, Share2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -25,6 +25,9 @@ import { useConfirm } from '@/components/ui/confirm-dialog'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
 import { PageHeader } from '@/components/console/page-header'
+import {
+  ClientKeyExportDialog, type ClientKeyExportSubject,
+} from '@/components/client-key-export-dialog'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -95,6 +98,7 @@ export function ClientKeysPage() {
   const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
+  const [exportSubject, setExportSubject] = useState<ClientKeyExportSubject | null>(null)
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
@@ -373,6 +377,12 @@ export function ClientKeysPage() {
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start">
+              <DropdownMenuItem
+                onSelect={() => setExportSubject({ id: k.id, name: k.name, disabled: k.disabled })}
+              >
+                <Share2 className="h-3.5 w-3.5" />
+                导出配置（直接使用 / CC Switch）
+              </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => handleRotate(k)}>
                 <RefreshCw className="h-3.5 w-3.5" />
                 重新生成 Key（旧 Key 立即失效）
@@ -440,6 +450,17 @@ export function ClientKeysPage() {
 
   const rowActions = (k: ClientKeyItem) => (
     <div className="flex items-center justify-end gap-1">
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={(e) => {
+          e.stopPropagation()
+          setExportSubject({ id: k.id, name: k.name, disabled: k.disabled })
+        }}
+        title="导出配置（直接使用 / CC Switch）"
+      >
+        <Share2 className="h-3.5 w-3.5" />
+      </Button>
       <Button
         size="icon"
         variant="ghost"
@@ -591,7 +612,7 @@ export function ClientKeysPage() {
             <DialogHeader>
               <DialogTitle>新建客户端 Key</DialogTitle>
               <DialogDescription>
-                创建后明文 Key 仅显示一次，请立即复制保存到安全位置。
+                创建后会显示明文 Key；之后也可以在列表里「导出配置」取回，生成 Claude Code / CC Switch 配置。
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={handleCreate} className="space-y-3 py-2">
@@ -666,7 +687,7 @@ export function ClientKeysPage() {
                 Key 已生成
               </DialogTitle>
               <DialogDescription>
-                这是 Key "{createdKey?.name}" 的明文。<strong>关闭对话框后将无法再查看</strong>，请立即复制。
+                这是 Key "{createdKey?.name}" 的明文。关闭后可在列表里点「导出配置」再次取回，或直接导出给 Claude Code / CC Switch。
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-3">
@@ -705,10 +726,30 @@ export function ClientKeysPage() {
               </p>
             </div>
             <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  if (!createdKey) return
+                  setExportSubject({ id: createdKey.id, name: createdKey.name, key: createdKey.key })
+                  setCreatedKey(null)
+                }}
+              >
+                <Share2 className="h-3.5 w-3.5" />
+                导出配置
+              </Button>
               <Button onClick={() => setCreatedKey(null)}>我已保存好</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
+      )}
+
+      {/* 导出配置对话框：直接使用 / CC Switch 导入 */}
+      {exportSubject && (
+        <ClientKeyExportDialog
+          key={exportSubject.id}
+          subject={exportSubject}
+          onClose={() => setExportSubject(null)}
+        />
       )}
 
       {/* 编辑对话框 */}

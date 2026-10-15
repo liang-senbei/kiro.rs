@@ -6,7 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-主题：**多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复**。
+主题：**多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复，以及客户端 Key 一键导出（直接使用 / CC Switch）**。
+
+### 📤 客户端 Key 导出
+
+- 客户端 Key 页新增「导出配置」（行内分享按钮、Key 下拉菜单、新建 / 轮换后的弹窗）：
+  - **直接使用**：Claude Code `settings.json` 片段、macOS / Linux 与 PowerShell 环境变量、`curl` 连通性测试，以及 Anthropic / OpenAI 兼容 base URL。
+  - **CC Switch 导入**：生成 `ccswitch://v1/import` 深链接，导入为 Claude Code 供应商、Anthropic 原生格式（`apiFormat=anthropic`），一键唤起 CC Switch 或复制链接发给使用者。
+- 服务地址默认取当前页面地址，可改成对外地址并被记住；本机 / 内网地址会提示。可选标准端点或 `/cc` 兼容端点。
+- 新增 `POST /api/admin/client-keys/{id}/export`，返回明文 Key（`Cache-Control: no-store`）。明文 Key 不再只在创建 / 轮换时可见，新建弹窗的提示文案随之更新。
 
 ### 🚦 账号突发限流（`USER_REQUEST_RATE_EXCEEDED`）
 

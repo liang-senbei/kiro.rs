@@ -4,6 +4,7 @@ import type {
   ClientKeysResponse,
   CreateClientKeyRequest,
   CreateClientKeyResponse,
+  ExportClientKeyResponse,
   UpdateClientKeyRequest,
   SuccessResponse,
 } from '@/types/api'
@@ -69,5 +70,11 @@ export async function setClientKeyMaxCredits(
 
 export async function rotateClientKey(id: number): Promise<CreateClientKeyResponse> {
   const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
+  return data
+}
+
+/** 取回明文 Key 用于导出配置。走 POST（服务端带 no-store），不进 react-query 缓存 */
+export async function exportClientKey(id: number): Promise<ExportClientKeyResponse> {
+  const { data } = await api.post<ExportClientKeyResponse>(`/client-keys/${id}/export`)
   return data
 }
