@@ -25,7 +25,7 @@ function outcomeStyle(outcome: string | null): {
     case "quota_exhausted":
       return { label: "额度耗尽", variant: "warning" };
     case "account_throttled":
-      return { label: "账号风控", variant: "warning" };
+      return { label: "账号限流", variant: "warning" };
     case "auth_failed":
       return { label: "鉴权失败", variant: "destructive" };
     case "transient":
@@ -36,6 +36,8 @@ function outcomeStyle(outcome: string | null): {
       return { label: "请求错误", variant: "destructive" };
     case "stream_interrupted":
       return { label: "流中断", variant: "warning" };
+    case "abandoned_before_headers":
+      return { label: "响应头未到达", variant: "warning" };
     default:
       return { label: outcome || "未知", variant: "secondary" };
   }

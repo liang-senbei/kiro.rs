@@ -916,8 +916,9 @@ impl CompletedToolUse {
 /// 工具调用 JSON 累积过程中的错误。
 ///
 /// - `InvalidJson`：上游把某个 tool_use 的完整 `input` 拼出来后，仍不是合法 JSON。
-/// - `IncompleteJson`：整条流结束时仍有 tool_use 从未收到 `stop=true`，即上游在
-///   工具参数写到一半时截断（“流式半截 JSON”）。
+/// - `IncompleteJson`：整条流结束时仍有 tool_use 累积了**非空**内容却从未收到
+///   `stop=true`，即上游在工具参数写到一半时截断（“流式半截 JSON”）。
+///   0 字节的滞留缓冲是无参工具的正常形态，不算截断，见 `ToolJsonAccumulator::finish`。
 ///
 /// 两种情况都**不能**把半截 / 非法 JSON 当成完整工具调用转发给客户端——那会让
 /// 客户端拿到无法解析或语义错误的参数去执行工具。这里显式暴露为错误，由上层
@@ -1526,6 +1527,14 @@ pub struct StreamContext {
     /// `metering` 跨重试保留用于结算；扣住工具调用 / 判定截断只能看本次响应自己的信号，
     /// 否则上一次「只有 thinking 但有 meteringEvent」的响应会让重试里的半截工具调用漏判。
     attempt_metered: bool,
+    /// 当前这次上游响应（透明重试时每次重置）的输出 token 估算。
+    ///
+    /// `output_tokens` 跨重试累计用于结算；contextUsage 只覆盖本次响应自己的上下文
+    /// （含本次输出），从它扣减输出时只能扣本次的，否则重试越多 input 越被少算。
+    attempt_output_tokens: i32,
+    /// 透明重试前那次响应的 contextUsage 换算值（已扣掉那次自己的输出）。
+    /// 重试后的响应没下发 contextUsage 时用它，而不是退回请求估算。
+    retried_context_input_tokens: Option<i32>,
 }
 
 impl StreamContext {
@@ -1543,8 +1552,21 @@ impl StreamContext {
             );
         }
 
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // contextUsage 覆盖的是生成结束后的整个上下文（含本轮输出），
+        // 先扣掉本轮输出再做 cache 分摊，避免输出被计两次。透明重试时只扣
+        // 下发这份 contextUsage 的那次响应自己的输出（见 attempt_output_tokens）。
+        let total_real = crate::token::input_tokens_excluding_output(
+            self.context_input_tokens,
+            self.retried_context_input_tokens.unwrap_or(self.input_tokens),
+            self.attempt_output_tokens,
+        );
         self.cache_usage.split_against_total(total_real)
+    }
+
+    /// 累计输出 token 估算：跨重试的总量（结算）与本次响应的量（扣减 contextUsage）同步增加。
+    fn add_output_tokens(&mut self, tokens: i32) {
+        self.output_tokens += tokens;
+        self.attempt_output_tokens += tokens;
     }
 
     /// 精确 provider 输出 token 优先，否则返回流内容的本地估算。
@@ -1604,6 +1626,8 @@ impl StreamContext {
             truncation_error: None,
             held_tool_uses: Vec::new(),
             attempt_metered: false,
+            attempt_output_tokens: 0,
+            retried_context_input_tokens: None,
         }
     }
 
@@ -1779,7 +1803,7 @@ impl StreamContext {
         }
 
         // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
+        self.add_output_tokens(estimate_tokens(content));
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -2300,7 +2324,7 @@ impl StreamContext {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
-                self.output_tokens += estimate_tokens(text);
+                self.add_output_tokens(estimate_tokens(text));
                 return self.create_text_delta_events(text);
             }
             return Vec::new();
@@ -2317,7 +2341,7 @@ impl StreamContext {
         if let Some(text) = reasoning.text.as_deref()
             && !text.is_empty()
         {
-            self.output_tokens += estimate_tokens(text);
+            self.add_output_tokens(estimate_tokens(text));
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
                 events.push(self.create_thinking_delta_event(idx, text));
@@ -2327,7 +2351,7 @@ impl StreamContext {
         if let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
-            self.output_tokens += 8;
+            self.add_output_tokens(8);
             events.extend(self.create_redacted_thinking_events(redacted));
         }
 
@@ -2432,7 +2456,7 @@ impl StreamContext {
         ));
 
         // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
-        self.output_tokens += estimate_tokens(&completed.input.to_string());
+        self.add_output_tokens(estimate_tokens(&completed.input.to_string()));
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             block_index,
             json!({
@@ -2731,6 +2755,15 @@ impl StreamContext {
         self.tool_json_accumulator = ToolJsonAccumulator::new();
         self.held_tool_uses.clear();
         self.attempt_metered = false;
+        // 上一次响应的 contextUsage 含它自己的输出：先扣掉再留作回退，新响应只扣新输出。
+        if let Some(total) = self.context_input_tokens.take() {
+            self.retried_context_input_tokens = Some(crate::token::input_tokens_excluding_output(
+                Some(total),
+                self.input_tokens,
+                self.attempt_output_tokens,
+            ));
+        }
+        self.attempt_output_tokens = 0;
         // 只在没有发出过工具调用时才会重试（见 is_retryable_truncation），可以放心复位。
         self.state_manager.set_has_tool_use(false);
         events
@@ -2851,166 +2884,6 @@ impl StreamContext {
                 .generate_error_events(error_type, message),
         );
         events
-    }
-}
-
-/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
-///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
-///
-/// 工作流程：
-/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
-/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
-/// 4. 一次性返回所有事件
-pub struct BufferedStreamContext {
-    /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
-    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
-    event_buffer: Vec<SseEvent>,
-    /// 是否已经生成了初始事件
-    initial_events_generated: bool,
-}
-
-impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-        known_tool_names: std::collections::HashSet<String>,
-    ) -> Self {
-        let inner = StreamContext::new_with_thinking(
-            model,
-            estimated_input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-        );
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            initial_events_generated: false,
-        }
-    }
-
-    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
-    pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
-        self.inner.cache_usage = cache_usage;
-    }
-
-    /// 处理 Kiro 事件并缓冲结果
-    ///
-    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
-    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        // 首次处理事件时，先生成初始事件（message_start 等）
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 处理事件并缓冲结果
-        let events = self.inner.process_kiro_event(event);
-        self.event_buffer.extend(events);
-    }
-
-    /// 完成流处理并返回所有事件
-    ///
-    /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
-    /// 3. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
-
-        // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
-        let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
-    }
-
-    /// 读上游响应体失败时的异常终态：丢弃全部缓冲，只返回一个 `error` 事件（不发 message_stop）。
-    ///
-    /// 缓冲模式下客户端此前只收到过 ping，缓冲里的内容可能是半截的。若走
-    /// [`Self::finish_and_get_all_events`]，半截回答会以 `end_turn` + message_stop 正常收尾，
-    /// 客户端把截断的回答当成完整回答写进历史。
-    pub fn abort_with_error(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
-        self.event_buffer.clear();
-        self.initial_events_generated = true;
-        vec![SseEvent::new(
-            "error",
-            json!({
-                "type": "error",
-                "error": {
-                    "type": error_type,
-                    "message": message
-                }
-            }),
-        )]
-    }
-
-    /// 取出最终用量（在 finish_and_get_all_events 之后调用）
-    ///
-    /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
-    pub fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
-        let (input, creation, read) = self.inner.resolved_usage();
-        (
-            input,
-            self.inner.resolved_output_tokens(),
-            creation,
-            read,
-            self.inner.credits,
-        )
-    }
-
-    /// 上游是否下发了精确 tokenUsage；配合 [`Self::cache_usage`] 推断 usage 来源。
-    pub fn has_provider_usage(&self) -> bool {
-        self.inner.provider_token_usage.is_some()
-    }
-
-    /// 本地 CacheMeter 的覆盖情况
-    pub fn cache_usage(&self) -> &super::cache_metering::CacheUsage {
-        &self.inner.cache_usage
-    }
-
-    /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
-    pub fn tool_json_error_message(&self) -> Option<String> {
-        self.inner.tool_json_error_message()
-    }
-
-    /// 「只有 thinking」异常终态的原因（转发内部 StreamContext）。缓冲流据此记 error。
-    pub fn truncation_error(&self) -> Option<&str> {
-        self.inner.truncation_error()
-    }
-
-    /// 记录没有转成客户端内容的上游帧类型（转发内部 StreamContext）。
-    pub fn note_dropped_frame(&mut self, kind: &str) {
-        self.inner.note_dropped_frame(kind)
     }
 }
 
@@ -6322,19 +6195,85 @@ mod tests {
             test_known_tools(),
         );
         ctx.context_input_tokens = Some(80);
-        ctx.output_tokens = 9;
+        ctx.add_output_tokens(9);
         ctx.cache_usage = CacheUsage {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
         };
 
-        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
+        // context 80 - output 9 = 71；按 cache_covered_est/prompt_total_est = 50/100
+        // 分摊：cache_total = round(71 * 0.5) = 36，read = round(36 * 25/50) = 18，
+        // creation = 36 - 18 = 18，uncached tail = 71 - 36 = 35。
+        assert_eq!(ctx.resolved_usage(), (35, 18, 18));
+        let (input, creation, read) = ctx.resolved_usage();
+        assert_eq!(
+            input + creation + read,
+            71,
+            "分摊必须发生在扣减之后，三份之和等于修正后的 total"
+        );
         assert_eq!(ctx.resolved_output_tokens(), 9);
     }
 
+    /// 透明重试后 contextUsage 只覆盖最后一次响应（含它自己的输出）：只能扣这次响应的输出，
+    /// 不能扣被重试掉的那几次累计的输出；结算的 output_tokens 仍是全部尝试之和。
     #[test]
-    fn buffered_stream_reports_the_same_provider_usage_in_events_and_final_usage() {
+    fn stream_usage_after_retry_subtracts_only_current_attempt_output() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.context_input_tokens = Some(80);
+        ctx.add_output_tokens(30);
+        let _ = ctx.prepare_truncation_retry();
+
+        // 重试响应还没下发 contextUsage：沿用上一次的换算值（80 - 30），而不是退回请求估算 100
+        assert_eq!(ctx.resolved_usage(), (50, 0, 0));
+
+        ctx.add_output_tokens(9);
+        ctx.context_input_tokens = Some(80);
+        assert_eq!(ctx.resolved_usage(), (71, 0, 0));
+        assert_eq!(ctx.resolved_output_tokens(), 39);
+    }
+
+    #[test]
+    fn stream_usage_without_context_usage_does_not_subtract_output() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let make = |output_tokens: i32| {
+            let mut ctx = StreamContext::new_with_thinking(
+                "claude-opus-4-7",
+                100,
+                false,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            ctx.context_input_tokens = None;
+            ctx.add_output_tokens(output_tokens);
+            ctx.cache_usage = CacheUsage {
+                cache_read: 25,
+                cache_covered_est: 50,
+                prompt_total_est: 100,
+            };
+            ctx.resolved_usage()
+        };
+
+        // 回退值来自 count_all_tokens 的 prompt 估算，本就不含输出：
+        // output 取 0 还是 9，分摊结果必须完全一致。
+        assert_eq!(make(9), make(0));
+        let (input, creation, read) = make(9);
+        assert_eq!(
+            input + creation + read,
+            100,
+            "回退分支的 total 仍是 input_tokens 原值"
+        );
+    }
+
+    #[test]
+    fn live_stream_reports_final_provider_usage_without_delaying_initial_event() {
         use crate::kiro::model::events::MetadataEvent;
 
         let usage = TokenUsage {
@@ -6343,57 +6282,33 @@ mod tests {
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
         };
-        let mut ctx = BufferedStreamContext::new(
+        let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-7",
             100,
             false,
             HashMap::new(),
             test_known_tools(),
         );
-        ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
-        }));
-        let events = ctx.finish_and_get_all_events();
+        })));
+        events.extend(ctx.generate_final_events());
 
-        assert_eq!(ctx.final_usage(), (3, 11, 4, 7, 0.0));
+        assert_eq!(ctx.resolved_usage(), (3, 4, 7));
         let start_usage = &events
             .iter()
             .find(|event| event.event == "message_start")
             .unwrap()
             .data["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], json!(3));
-        assert_eq!(start_usage["cache_creation_input_tokens"], json!(4));
-        assert_eq!(start_usage["cache_read_input_tokens"], json!(7));
+        assert_eq!(start_usage["input_tokens"], json!(100));
+        assert_eq!(start_usage["cache_creation_input_tokens"], json!(0));
+        assert_eq!(start_usage["cache_read_input_tokens"], json!(0));
         let delta_usage = &events
             .iter()
             .find(|event| event.event == "message_delta")
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
-    }
-
-    /// 缓冲流读 body 失败：半截回答不能以 message_stop 正常收尾，只发 error 终态。
-    #[test]
-    fn buffered_stream_read_failure_sends_only_an_error_event() {
-        let mut ctx = BufferedStreamContext::new(
-            "claude-opus-4-7",
-            100,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        ctx.process_and_buffer(&text_evt("答案的前半段，后面还没"));
-
-        let events =
-            ctx.abort_with_error(TRUNCATION_ERROR_TYPE, "Upstream response stream was interrupted");
-        assert_eq!(
-            events.len(),
-            1,
-            "{:?}",
-            events.iter().map(|e| &e.event).collect::<Vec<_>>()
-        );
-        assert_eq!(events[0].event, "error");
-        assert_eq!(events[0].data["error"]["type"], json!(TRUNCATION_ERROR_TYPE));
-        assert!(ctx.finish_and_get_all_events().iter().all(|e| e.event != "message_start"));
     }
 }

@@ -250,6 +250,31 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     total.max(1)
 }
 
+/// 从 contextUsage 换算出的上下文总量里扣掉本轮输出，得到真正的 input 口径。
+///
+/// 上游 `metadataEvent.tokenUsage` 实测从未下发，100% 走 `contextUsageEvent`
+/// 回退路径；而 `contextUsageEvent` 在流末尾才到达，其百分比覆盖的是
+/// 「生成结束后」的整个上下文（Kiro 注入的 system prompt + 本轮 prompt +
+/// **本轮输出**）。直接当 `input_tokens` 上报会把输出重复计一次
+/// （另一次已经在 `output_tokens` 里）。
+///
+/// - `context_total`：`contextUsagePercentage × window / 100` 的换算值。
+/// - `fallback_input`：无 `contextUsageEvent` 时的 prompt 估算（来自
+///   `count_all_tokens`，只统计客户端发来的 prompt，本就不含输出），不做扣减。
+/// - `output_tokens`：本轮输出的 token 数（精确值或本地估算）。
+pub(crate) fn input_tokens_excluding_output(
+    context_total: Option<i32>,
+    fallback_input: i32,
+    output_tokens: i32,
+) -> i32 {
+    match context_total {
+        // 输出估算与 contextUsage 换算是两套口径，极端情况下前者可能超过后者；
+        // 下限 clamp 到 0（不是 1）——宁可少报，也不凭空造出 input token。
+        Some(total) => total.max(0).saturating_sub(output_tokens.max(0)).max(0),
+        None => fallback_input.max(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +302,30 @@ mod tests {
         })]);
 
         assert!(tokens >= 8);
+    }
+
+    #[test]
+    fn input_tokens_excluding_output_subtracts_output_from_context_total() {
+        // 实测样本：contextUsage 换算 8404，本轮输出估算 1514。
+        assert_eq!(input_tokens_excluding_output(Some(8404), 25, 1514), 6890);
+    }
+
+    #[test]
+    fn input_tokens_excluding_output_keeps_fallback_untouched() {
+        // 无 contextUsageEvent 时的回退值来自 count_all_tokens，只统计客户端
+        // 发来的 prompt，本就不含输出，再减会偏低，因此原样返回（仅做负值保护）。
+        assert_eq!(input_tokens_excluding_output(None, 25, 1514), 25);
+        assert_eq!(input_tokens_excluding_output(None, -3, 10), 0);
+    }
+
+    #[test]
+    fn input_tokens_excluding_output_clamps_when_output_estimate_exceeds_total() {
+        // 输出估算与 contextUsage 换算是两套口径，前者可能超过后者。
+        // 下限取 0（不是 1）：宁可少报，也不凭空造出 input token。
+        assert_eq!(input_tokens_excluding_output(Some(10), 25, 999), 0);
+        // 负的 output 不得反向放大 total。
+        assert_eq!(input_tokens_excluding_output(Some(10), 25, -5), 10);
+        // 负的 context_total 也 clamp 到 0。
+        assert_eq!(input_tokens_excluding_output(Some(-7), 25, 0), 0);
     }
 }

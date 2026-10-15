@@ -58,7 +58,7 @@ function outcomeStyle(outcome: string): {
     case 'quota_exhausted':
       return { label: '额度耗尽', variant: 'warning' }
     case 'account_throttled':
-      return { label: '账号风控', variant: 'warning' }
+      return { label: '账号限流', variant: 'warning' }
     case 'auth_failed':
       return { label: '鉴权失败', variant: 'destructive' }
     case 'transient':
@@ -69,6 +69,8 @@ function outcomeStyle(outcome: string): {
       return { label: '请求错误', variant: 'destructive' }
     case 'stream_interrupted':
       return { label: '流中断', variant: 'warning' }
+    case 'abandoned_before_headers':
+      return { label: '响应头未到达', variant: 'warning' }
     default:
       return { label: outcome || '未知', variant: 'secondary' }
   }
@@ -378,12 +380,13 @@ const STATUS_OPTIONS = [
 const ERROR_TYPE_OPTIONS = [
   { value: '', label: '全部错误类型' },
   { value: 'quota_exhausted', label: '额度耗尽' },
-  { value: 'account_throttled', label: '账号风控' },
+  { value: 'account_throttled', label: '账号限流' },
   { value: 'auth_failed', label: '鉴权失败' },
   { value: 'transient', label: '瞬态错误' },
   { value: 'network_error', label: '网络错误' },
   { value: 'bad_request', label: '请求错误' },
   { value: 'stream_interrupted', label: '流中断' },
+  { value: 'abandoned_before_headers', label: '响应头未到达' },
   { value: 'unknown', label: '未知' },
 ]
 
@@ -805,7 +808,7 @@ function TraceExpandedDetail({
         <div className="space-y-2">
           {rec.attempts.length === 0 ? (
             <div className="rounded-lg border border-border/40 bg-secondary/20 p-3 text-center text-xs text-muted-foreground">
-              无上游尝试记录（请求在到达上游凭据前被拦截或校验失败）
+              无上游尝试记录（首跳尚未返回结果即结束，或请求在到达上游凭据前被拦截/校验失败）
             </div>
           ) : (
             rec.attempts.map((a) => <AttemptRow key={a.attempt} a={a} />)

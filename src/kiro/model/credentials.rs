@@ -813,11 +813,45 @@ impl KiroCredentials {
             .unwrap_or(config.effective_auth_region())
     }
 
+    /// 获取真实 profileArn 中声明的 Region。
+    ///
+    /// Enterprise / IdC 的数据面请求必须访问与 profile 所属 Region 一致的端点；
+    /// profileArn 缺失、为 BuilderID 占位符或格式异常时不参与 Region 推断。
+    fn profile_arn_region(&self) -> Option<&str> {
+        let arn = self.effective_profile_arn()?;
+        let mut parts = arn.split(':');
+        let (Some("arn"), Some(partition), Some(service), Some(region), Some(account), Some(resource)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return None;
+        };
+
+        if parts.next().is_some()
+            || partition.is_empty()
+            || service != "codewhisperer"
+            || region.is_empty()
+            || account.is_empty()
+            || !resource.starts_with("profile/")
+            || resource.len() == "profile/".len()
+        {
+            return None;
+        }
+
+        Some(region)
+    }
+
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > 凭据.region > config.api_region > config.region
+    /// 优先级：显式凭据.api_region > 真实 profileArn Region > 凭据.region >
+    /// config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .or_else(|| self.profile_arn_region())
             .or(self.region.as_deref())
             .unwrap_or(config.effective_api_region())
     }
@@ -1280,6 +1314,38 @@ mod tests {
         // 无 ARN → None
         cred.profile_arn = None;
         assert_eq!(cred.effective_profile_arn(), None);
+    }
+
+    #[test]
+    fn test_effective_api_region_prefers_real_profile_arn_region() {
+        let cred: KiroCredentials = serde_json::from_str(
+            r#"{
+                "region": "eu-west-1",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123"
+            }"#,
+        )
+        .unwrap();
+        let config = Config::default();
+
+        assert_eq!(cred.effective_api_region(&config), "us-east-1");
+    }
+
+    #[test]
+    fn test_effective_api_region_ignores_malformed_profile_arn() {
+        for profile_arn in [
+            "arn:aws:other-service:us-east-1:123456789012:profile/REAL123",
+            "arn:aws:codewhisperer:us-east-1:123456789012:resource/REAL123",
+            "arn:aws:codewhisperer::123456789012:profile/REAL123",
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/",
+        ] {
+            let cred: KiroCredentials = serde_json::from_value(serde_json::json!({
+                "region": "eu-west-1",
+                "profileArn": profile_arn,
+            }))
+            .unwrap();
+
+            assert_eq!(cred.effective_api_region(&Config::default()), "eu-west-1");
+        }
     }
 
     #[test]

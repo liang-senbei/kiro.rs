@@ -6,6 +6,10 @@
 //!
 //! Reuses: converter::convert_request (feedback), provider.call_api_stream, EventStreamDecoder,
 //! websearch::{create_mcp_request, call_mcp_api, parse_search_results, generate_search_summary}。
+//!
+//! Cache metering is computed independently for every internal model round. Provider
+//! tokenUsage remains authoritative; otherwise the round's total prompt is split by
+//! CacheMeter and the mutually exclusive input/write/read values are aggregated.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -34,6 +38,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
+use super::cache_metering::{CacheUsage, SharedCacheMeter};
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
@@ -107,10 +112,15 @@ struct RoundOutcome {
 }
 
 impl RoundOutcome {
-    /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时只回退本轮。
-    fn resolved_token_usage(&self, fallback_input_tokens: i32) -> TokenUsage {
+    /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时，使用本轮
+    /// CacheMeter 结果把总 prompt 拆成互斥的 input / cache-write / cache-read。
+    fn resolved_token_usage(
+        &self,
+        fallback_input_tokens: i32,
+        cache_usage: CacheUsage,
+    ) -> (TokenUsage, UsageSource) {
         if let Some(usage) = self.provider_token_usage {
-            return usage.sanitized();
+            return (usage.sanitized(), UsageSource::Provider);
         }
 
         let mut output = Vec::new();
@@ -126,15 +136,32 @@ impl RoundOutcome {
                 .map(CompletedToolUse::to_anthropic_block),
         );
 
-        TokenUsage {
-            uncached_input_tokens: self
-                .context_input_tokens
-                .unwrap_or(fallback_input_tokens)
-                .max(0),
-            output_tokens: token::estimate_output_tokens(&output),
-            cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
-        }
+        // contextUsage 覆盖生成结束后的整个上下文（含本轮输出）。这里逐轮
+        // saturating_add 累加，不扣的话 N 轮会把输出重复放大 N 次。
+        let output_tokens = token::estimate_output_tokens(&output);
+        let total_input_tokens = token::input_tokens_excluding_output(
+            self.context_input_tokens,
+            fallback_input_tokens,
+            output_tokens,
+        );
+        (
+            split_simulated_usage(total_input_tokens, output_tokens, cache_usage),
+            UsageSource::resolve(false, &cache_usage),
+        )
+    }
+}
+
+fn split_simulated_usage(
+    total_input_tokens: i32,
+    output_tokens: i32,
+    cache_usage: CacheUsage,
+) -> TokenUsage {
+    let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input_tokens);
+    TokenUsage {
+        uncached_input_tokens: input,
+        output_tokens: output_tokens.max(0),
+        cache_read_input_tokens: cache_read,
+        cache_write_input_tokens: cache_write,
     }
 }
 
@@ -378,6 +405,7 @@ struct RoundFailure {
     error_message: String,
     credential_id: u64,
     token_usage: Option<TokenUsage>,
+    usage_source: UsageSource,
     credits: f64,
 }
 
@@ -389,6 +417,7 @@ async fn run_round(
     provider: &Arc<KiroProvider>,
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
+    cache_usage: CacheUsage,
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
@@ -421,6 +450,7 @@ async fn run_round(
                 error_message,
                 credential_id: 0,
                 token_usage: None,
+                usage_source: UsageSource::Unknown,
                 credits: 0.0,
             });
         }
@@ -445,6 +475,7 @@ async fn run_round(
                 error_message,
                 credential_id: 0,
                 token_usage: None,
+                usage_source: UsageSource::Unknown,
                 credits: 0.0,
             });
         }
@@ -458,19 +489,21 @@ async fn run_round(
         Err(e) => {
             let error_type = last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN);
             let error_message = e.to_string();
+            let token_usage = split_simulated_usage(fallback_input_tokens, 0, cache_usage);
             return Err(RoundFailure {
                 response: map_provider_error(e),
                 error_type,
                 error_message,
                 credential_id: 0,
-                token_usage: Some(TokenUsage {
-                    uncached_input_tokens: fallback_input_tokens.max(0),
-                    ..TokenUsage::default()
-                }),
+                token_usage: Some(token_usage),
+                usage_source: UsageSource::resolve(false, &cache_usage),
                 credits: 0.0,
             });
         }
     };
+    // `call_api_stream` 成功返回即已收到上游 HTTP response headers；在 decode_round
+    // 读取 body 前标记，确保该窗口取消时不会被 RequestTracer::Drop 误归为等头中断。
+    tracer.mark_upstream_headers_received();
     let credential_id = call_result.credential_id;
     let mut outcome = decode_round(
         call_result.response,
@@ -487,7 +520,8 @@ async fn run_round(
     if let Some(error_message) = outcome.stream_error.take() {
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
-        let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
+        let (token_usage, usage_source) =
+            outcome.resolved_token_usage(fallback_input_tokens, cache_usage);
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
@@ -502,6 +536,7 @@ async fn run_round(
             error_message,
             credential_id,
             token_usage: Some(token_usage),
+            usage_source,
             credits: outcome.credits,
         });
     }
@@ -780,8 +815,8 @@ struct WebSearchUsageSettlement {
     usage: TokenUsage,
     credits: f64,
     settled: bool,
-    /// 多轮聚合后的 usage 来源：全部轮次都有上游精确值才算 provider，
-    /// 任一轮回退到本地估算即降级为 none（web_search 回退不走 CacheMeter，缓存恒为 0）。
+    /// 多轮聚合后的 usage 来源：全部轮次都有上游精确值才算 provider；任一轮
+    /// 使用 CacheMeter 则标 simulated；其余混合回退标 none。
     source: UsageSource,
 }
 
@@ -821,17 +856,28 @@ impl WebSearchUsageSettlement {
         }
     }
 
-    /// 记录本轮 usage 是否来自上游精确值。
-    fn note_source(&mut self, from_provider: bool) {
-        self.source = match (self.source, from_provider) {
-            (UsageSource::Unknown, true) => UsageSource::Provider,
-            (UsageSource::Provider, true) => UsageSource::Provider,
+    /// 合并本轮 usage 来源。聚合值只要包含模拟缓存就不能标成 provider 真值。
+    fn note_source(&mut self, round_source: UsageSource) {
+        self.source = match (self.source, round_source) {
+            (UsageSource::Unknown, next) => next,
+            (current, UsageSource::Unknown) => current,
+            (UsageSource::Provider, UsageSource::Provider) => UsageSource::Provider,
+            (UsageSource::Simulated, _) | (_, UsageSource::Simulated) => UsageSource::Simulated,
             _ => UsageSource::None,
         };
     }
 
     fn usage(&self) -> TokenUsage {
         self.usage.sanitized()
+    }
+
+    /// 构造最终响应的计费信息：费用取整条 agentic loop 中所有模型调用的
+    /// meteringEvent 累计值，单位沿用最近一次上游事件。
+    fn response_metering(&self, latest: Option<&MeteringEvent>) -> Option<MeteringEvent> {
+        latest.map(|metering| MeteringEvent {
+            usage: self.credits,
+            ..metering.clone()
+        })
     }
 
     fn finish(
@@ -1296,6 +1342,8 @@ pub(super) async fn run_web_search_loop(
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    cache_meter: Option<SharedCacheMeter>,
+    key_id: u64,
 ) -> Response {
     if !stream_client {
         return run_web_search_loop_inner(
@@ -1305,6 +1353,8 @@ pub(super) async fn run_web_search_loop(
             tracer,
             group,
             tool_compatibility_mode,
+            cache_meter,
+            key_id,
             None,
         )
         .await;
@@ -1334,6 +1384,8 @@ pub(super) async fn run_web_search_loop(
                 tracer,
                 group,
                 tool_compatibility_mode,
+                cache_meter,
+                key_id,
                 Some(&mut emitter),
             ))
             .catch_unwind(),
@@ -1374,6 +1426,8 @@ async fn run_web_search_loop_inner(
     tracer: Arc<RequestTracer>,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    cache_meter: Option<SharedCacheMeter>,
+    key_id: u64,
     mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
@@ -1390,10 +1444,17 @@ async fn run_web_search_loop_inner(
                 payload.messages.clone(),
                 payload.tools.clone(),
             ) as i32;
+            let round_cache_usage = match cache_meter.as_ref() {
+                Some(cache) => {
+                    super::cache_metering::compute_cache_usage(cache, &payload, key_id).await
+                }
+                None => CacheUsage::default(),
+            };
             let (round, credential_id) = match run_round(
                 &provider,
                 &payload,
                 round_fallback_input_tokens,
+                round_cache_usage,
                 tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
@@ -1404,6 +1465,7 @@ async fn run_web_search_loop_inner(
                 Err(failure) => {
                     if let Some(usage) = failure.token_usage {
                         settlement.add(failure.credential_id, usage, failure.credits);
+                        settlement.note_source(failure.usage_source);
                     } else {
                         settlement.add(
                             failure.credential_id,
@@ -1420,13 +1482,12 @@ async fn run_web_search_loop_inner(
                     return failure.response;
                 }
             };
-            settlement.add(
-                credential_id,
-                round.resolved_token_usage(round_fallback_input_tokens),
-                round.credits,
-            );
-            settlement.note_source(round.provider_token_usage.is_some());
-            // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
+            let (round_usage, usage_source) =
+                round.resolved_token_usage(round_fallback_input_tokens, round_cache_usage);
+            settlement.add(credential_id, round_usage, round.credits);
+            settlement.note_source(usage_source);
+            // 跨 round 保留最近一次 meteringEvent 的单位字段；最终响应中的 usage
+            // 会替换为 settlement 累计的所有模型调用费用。
             // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
             if let Some(ref m) = round.last_metering {
                 latest_metering = Some(m.clone());
@@ -1576,6 +1637,7 @@ async fn run_web_search_loop_inner(
         );
 
         let final_usage = settlement.usage();
+        let final_metering = settlement.response_metering(latest_metering.as_ref());
         settlement.finish("success", "success", None, None);
 
         return if let Some(emitter) = emitter.as_deref_mut() {
@@ -1585,7 +1647,7 @@ async fn run_web_search_loop_inner(
                     &stop_reason,
                     final_usage,
                     &all_thinking,
-                    latest_metering.as_ref(),
+                    final_metering.as_ref(),
                 )
                 .await;
             StatusCode::OK.into_response()
@@ -1596,7 +1658,7 @@ async fn run_web_search_loop_inner(
                 &stop_reason,
                 final_usage,
                 &all_thinking,
-                latest_metering.as_ref(),
+                final_metering.as_ref(),
             )
         };
     }
@@ -3042,7 +3104,13 @@ mod tests {
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
         });
-        let provider_usage = provider_round.resolved_token_usage(888);
+        let simulated = CacheUsage {
+            cache_read: 50,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+        };
+        let (provider_usage, provider_source) = provider_round.resolved_token_usage(888, simulated);
+        assert_eq!(provider_source, UsageSource::Provider);
         assert_eq!(
             provider_usage,
             TokenUsage {
@@ -3055,17 +3123,200 @@ mod tests {
 
         let mut fallback_round = round_outcome("fallback output", vec![]);
         fallback_round.context_input_tokens = Some(20);
-        let fallback_usage = fallback_round.resolved_token_usage(500);
-        assert_eq!(fallback_usage.uncached_input_tokens, 20);
+        let (fallback_usage, fallback_source) =
+            fallback_round.resolved_token_usage(500, CacheUsage::default());
+        assert_eq!(fallback_source, UsageSource::None);
+        // "fallback output" = 15 个西文字符 → count_tokens 得 5 个输出 token。
+        assert_eq!(fallback_usage.output_tokens, 5);
+        // context 20 - output 5 = 15。
+        assert_eq!(fallback_usage.uncached_input_tokens, 15);
         assert_eq!(fallback_usage.cache_write_input_tokens, 0);
         assert_eq!(fallback_usage.cache_read_input_tokens, 0);
         assert!(fallback_usage.output_tokens > 0);
 
         let total = provider_usage.saturating_add(fallback_usage);
-        assert_eq!(total.uncached_input_tokens, 23);
+        // provider 轮 3（精确值不扣） + fallback 轮 15 = 18
+        assert_eq!(total.uncached_input_tokens, 18);
         assert_eq!(total.output_tokens, 5 + fallback_usage.output_tokens);
         assert_eq!(total.cache_write_input_tokens, 4);
         assert_eq!(total.cache_read_input_tokens, 7);
+    }
+
+    #[test]
+    fn round_usage_without_context_usage_does_not_subtract_output() {
+        let round = round_outcome("fallback output", vec![]);
+        // round_outcome 辅助函数默认不带 contextUsage。
+        assert_eq!(round.context_input_tokens, None);
+
+        let (usage, source) = round.resolved_token_usage(500, CacheUsage::default());
+        assert_eq!(source, UsageSource::None);
+        // 回退值 500 来自 count_all_tokens 的 prompt 估算，本就不含输出，原样返回。
+        assert_eq!(usage.uncached_input_tokens, 500);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn multiple_fallback_rounds_each_subtract_their_own_output() {
+        // 两轮都走 contextUsage 回退分支，输出文本相同（"fallback output"
+        // = 15 个西文字符 → count_tokens 得 5 个输出 token），contextUsage 不同。
+        let mut round_a = round_outcome("fallback output", vec![]);
+        round_a.context_input_tokens = Some(20);
+        let mut round_b = round_outcome("fallback output", vec![]);
+        round_b.context_input_tokens = Some(30);
+
+        let (usage_a, source_a) = round_a.resolved_token_usage(500, CacheUsage::default());
+        let (usage_b, source_b) = round_b.resolved_token_usage(500, CacheUsage::default());
+        assert_eq!(source_a, UsageSource::None);
+        assert_eq!(source_b, UsageSource::None);
+        assert_eq!(usage_a.output_tokens, 5);
+        assert_eq!(usage_b.output_tokens, 5);
+        // 逐轮扣减：20-5=15，30-5=25。
+        assert_eq!(usage_a.uncached_input_tokens, 15);
+        assert_eq!(usage_b.uncached_input_tokens, 25);
+
+        let total = usage_a.saturating_add(usage_b);
+        // 累计必须等于两轮各自 (context - output) 之和 = 15 + 25 = 40。
+        // 若实现只在累加后扣一次输出，这里会得到 (20+30) - 5 = 45；
+        // 若完全不扣，会得到 50。两种错法都会在这条断言上失败。
+        assert_eq!(
+            usage_a.uncached_input_tokens + usage_b.uncached_input_tokens,
+            40
+        );
+        assert_eq!(total.uncached_input_tokens, 40);
+        assert_eq!(total.output_tokens, 10);
+        // 无断点时不做 cache 分摊，两项恒为 0。
+        assert_eq!(total.cache_write_input_tokens, 0);
+        assert_eq!(total.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn fallback_round_splits_total_with_cache_metering() {
+        let mut round = round_outcome("fallback output", vec![]);
+        round.context_input_tokens = Some(105);
+        let cache_usage = CacheUsage {
+            cache_read: 60,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+        };
+
+        let (usage, source) = round.resolved_token_usage(999, cache_usage);
+
+        // context 105 includes 5 output tokens, leaving a 100-token prompt.
+        // CacheMeter covers 80%: 60 read + 20 write + 20 ordinary input.
+        assert_eq!(usage.uncached_input_tokens, 20);
+        assert_eq!(usage.cache_write_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 60);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(source, UsageSource::Simulated);
+        assert_eq!(usage.total_input_tokens(), 100);
+    }
+
+    #[test]
+    fn websearch_rounds_advance_cache_prefix_and_preserve_token_conservation() {
+        use crate::anthropic::cache_metering::{CacheMeter, compute_cache_usage_sync};
+
+        let cache = CacheMeter::new(None);
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "Search for the latest Rust release and summarize it."
+                }]
+            }],
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 8
+                },
+                {
+                    "name": "exec_command",
+                    "description": "Run a local command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}}
+                    }
+                }
+            ],
+            "metadata": {
+                "user_id": "codex_session_c479866d-b846-4e87-807b-a5ed0d84948c"
+            },
+            "cache_control": {"type": "ephemeral"}
+        }))
+        .unwrap();
+        assert!(websearch::has_web_search_among_tools(&payload));
+
+        let first_total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        let first_cache = compute_cache_usage_sync(&cache, &payload, 42);
+        let first_usage = split_simulated_usage(first_total, 0, first_cache);
+        assert_eq!(first_usage.cache_read_input_tokens, 0);
+        assert!(first_usage.cache_write_input_tokens > 0);
+        assert_eq!(first_usage.total_input_tokens(), first_total);
+
+        let search_round = round_outcome(
+            "I will search for the current release.",
+            vec![tu_with_input(json!({"query": "latest Rust release"}))],
+        );
+        let mut presentation = Vec::new();
+        append_search_round(
+            &mut payload,
+            &search_round,
+            &[fake_results("latest Rust release")],
+            &mut presentation,
+        );
+
+        let second_total = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        let second_cache = compute_cache_usage_sync(&cache, &payload, 42);
+        let second_usage = split_simulated_usage(second_total, 0, second_cache);
+        assert_eq!(
+            second_cache.cache_read, first_cache.cache_covered_est,
+            "the next internal round should reuse the prefix written by round one"
+        );
+        assert!(second_usage.cache_read_input_tokens > 0);
+        assert!(
+            second_usage.cache_write_input_tokens > 0,
+            "the assistant tool call and tool result should extend the cached prefix"
+        );
+        assert_eq!(second_usage.total_input_tokens(), second_total);
+
+        let aggregate = first_usage.saturating_add(second_usage);
+        assert_eq!(
+            aggregate.total_input_tokens(),
+            first_total.saturating_add(second_total)
+        );
+        assert!(aggregate.cache_write_input_tokens > 0);
+        assert!(aggregate.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn settlement_source_marks_any_simulated_round_as_simulated() {
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 0,
+            model: "gpt-5.6-sol".to_string(),
+            started_at: std::time::Instant::now(),
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.note_source(UsageSource::Provider);
+        settlement.note_source(UsageSource::Simulated);
+        settlement.note_source(UsageSource::Provider);
+        assert_eq!(settlement.source, UsageSource::Simulated);
+        settlement.settled = true;
     }
 
     #[test]
@@ -3166,6 +3417,60 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
         }
+    }
+
+    #[test]
+    fn final_responses_sum_credit_usage_across_model_rounds() {
+        let hook = UsageRecordHook {
+            recorder: None,
+            aggregator: None,
+            client_keys: None,
+            key_id: 0,
+            model: "gpt-5.6-sol".to_string(),
+            started_at: std::time::Instant::now(),
+        };
+        let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+        settlement.add(1, token_usage(10, 2), 0.25);
+        settlement.add(1, token_usage(20, 3), 0.50);
+        let latest = metering_event(0.50);
+        let metering = settlement
+            .response_metering(Some(&latest))
+            .expect("two metered rounds must produce response metering");
+
+        assert_eq!(metering.usage, 0.75);
+        assert_eq!(metering.unit, latest.unit);
+        assert_eq!(metering.unit_plural, latest.unit_plural);
+
+        let content = vec![json!({"type": "text", "text": "ok"})];
+        let response = render_json(
+            "gpt-5.6-sol",
+            content.clone(),
+            "end_turn",
+            settlement.usage(),
+            "",
+            Some(&metering),
+        );
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+        });
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["usage"]["credit_usage"], json!(0.75));
+
+        let events = build_sse_events(
+            "gpt-5.6-sol",
+            content,
+            "end_turn",
+            settlement.usage(),
+            Some(&metering),
+        );
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("streaming response must contain message_delta");
+        assert_eq!(delta.data["usage"]["credit_usage"], json!(0.75));
+        settlement.settled = true;
     }
 
     #[test]

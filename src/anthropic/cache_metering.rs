@@ -33,8 +33,28 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 默认条目上限（防止内存无限增长）
-const DEFAULT_CAPACITY: usize = 4096;
+/// 未配置时的默认条目上限。
+///
+/// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+/// 上游 `entries_per_req <= MAX_BREAKPOINTS = 4`、默认 `TTL = 300s`，
+/// 262144 支撑约 `262144 / (4 * 300) ≈ 218 req/s`，内存约 16–24MB。
+const DEFAULT_CAPACITY: usize = 262_144;
+/// 容量下限（再小就不如直接关掉计量）
+const MIN_CAPACITY: usize = 1_024;
+/// 容量上限：按 64 字节/条估算约 512MB，是「再大就该上 Redis」的界线，不是推荐值
+const MAX_CAPACITY: usize = 8_388_608;
+/// 默认落盘间隔（秒）
+const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 300;
+/// 落盘间隔下限（秒）
+const MIN_FLUSH_INTERVAL_SECS: u64 = 10;
+/// 落盘间隔上限（秒）
+const MAX_FLUSH_INTERVAL_SECS: u64 = 3_600;
+/// 后台巡检周期（秒）：清过期 + 水位检查 + 指标输出。与落盘间隔无关。
+const SWEEP_INTERVAL_SECS: u64 = 60;
+/// 墓碑表硬上限。**不随 capacity 变化**：按 48 字节/条估算约 3MB 封顶。
+/// 超限整表清空，归因会在清空后的一小段时间里把本应 `miss_evicted` 的记成
+/// `miss_no_entry` —— 这是诊断信息，不影响计量正确性。
+const TOMBSTONE_CAPACITY: usize = 65_536;
 /// 最长 TTL（1h，与 Anthropic ttl=\"1h\" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
@@ -416,6 +436,74 @@ pub struct CacheMeter {
     /// 计量模拟总开关（运行时可由 Admin API 切换，无需重启）。
     /// 关闭时 `compute_cache_usage` 直接返回全量 input、零缓存，且不读写任何缓存态。
     enabled: std::sync::atomic::AtomicBool,
+    /// 生效条目上限，构造后不变（改容量 = 改 config.json + 重启）
+    capacity: usize,
+    /// miss 归因开关，构造后不变
+    miss_diagnostics: bool,
+    /// 落盘间隔（秒），构造后不变
+    flush_interval_secs: u64,
+}
+
+/// 单次查找的结果与 miss 归因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupOutcome {
+    /// 命中且已滑动续期
+    Hit(u32),
+    /// 条目还在表里但已过期，或命中 `Expired` 墓碑
+    Expired,
+    /// 命中 `Evicted` 墓碑：条目曾存在，被容量淘汰
+    Evicted,
+    /// 表里没有、墓碑里也没有
+    Absent,
+}
+
+/// 条目消失的原因，用于区分 `miss_evicted` / `miss_expired` / `miss_no_entry`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneKind {
+    /// 被容量水位淘汰
+    Evicted,
+    /// 被 TTL 过期清理
+    Expired,
+}
+
+/// 计量模拟的运行计数器快照。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub miss_no_entry: u64,
+    pub miss_expired: u64,
+    pub miss_evicted: u64,
+    pub miss_no_breakpoint: u64,
+    pub miss_no_seed: u64,
+    pub evicted_total: u64,
+    pub expired_total: u64,
+    pub tombstone_clears: u64,
+}
+
+impl StatsSnapshot {
+    /// 本周期是否完全没有事情发生（用于抑制空转日志）。
+    pub fn is_all_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// 同时维护「本周期增量」与「进程累计」两份计数。
+#[derive(Default)]
+struct Stats {
+    total: StatsSnapshot,
+    delta: StatsSnapshot,
+}
+
+impl Stats {
+    fn add(&mut self, pick: fn(&mut StatsSnapshot) -> &mut u64, n: u64) {
+        *pick(&mut self.total) = pick(&mut self.total).saturating_add(n);
+        *pick(&mut self.delta) = pick(&mut self.delta).saturating_add(n);
+    }
+
+    fn take_delta(&mut self) -> StatsSnapshot {
+        std::mem::take(&mut self.delta)
+    }
 }
 
 #[derive(Default)]
@@ -423,6 +511,10 @@ struct Inner {
     entries: HashMap<u64, CacheEntry>,
     /// 自上次落盘后是否有变化
     dirty: bool,
+    /// 运行计数器（已在 Mutex 保护下，不额外加锁）
+    stats: Stats,
+    /// miss 归因墓碑表，上限 `TOMBSTONE_CAPACITY`；`miss_diagnostics` 关闭时恒为空
+    tombstones: HashMap<u64, TombstoneKind>,
 }
 
 impl CacheMeter {
@@ -460,6 +552,9 @@ impl CacheMeter {
             persist_path,
             remote,
             enabled: std::sync::atomic::AtomicBool::new(true),
+            capacity: DEFAULT_CAPACITY,
+            miss_diagnostics: true,
+            flush_interval_secs: DEFAULT_FLUSH_INTERVAL_SECS,
         }
     }
 
@@ -481,6 +576,76 @@ impl CacheMeter {
         self
     }
 
+    /// builder 风格设置生效容量。调用方应先用 `resolve_capacity` 算出钳制后的值。
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity.clamp(MIN_CAPACITY, MAX_CAPACITY);
+        self
+    }
+
+    /// 当前生效容量。
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// builder 风格设置 miss 归因开关。关闭后完全不建墓碑表，内存归零。
+    pub fn with_miss_diagnostics(mut self, enabled: bool) -> Self {
+        self.miss_diagnostics = enabled;
+        if !enabled {
+            self.inner.lock().tombstones.clear();
+        }
+        self
+    }
+
+    /// miss 归因是否开启。
+    pub fn miss_diagnostics(&self) -> bool {
+        self.miss_diagnostics
+    }
+
+    /// builder 风格设置落盘间隔（秒），自动钳到 `[10, 3600]`。
+    pub fn with_flush_interval_secs(mut self, secs: u64) -> Self {
+        self.flush_interval_secs = secs.clamp(MIN_FLUSH_INTERVAL_SECS, MAX_FLUSH_INTERVAL_SECS);
+        self
+    }
+
+    /// 当前生效的落盘间隔（秒）。
+    pub fn flush_interval_secs(&self) -> u64 {
+        self.flush_interval_secs
+    }
+
+    /// 是否开启磁盘快照。关闭即 `persist_path == None`：
+    /// 启动不读文件、运行不写文件、退出不写文件，也不删除已有文件。
+    pub fn persist_enabled(&self) -> bool {
+        self.persist_path.is_some()
+    }
+
+    /// 输出本周期增量指标。本周期无任何增量时不输出，避免空转刷屏。
+    pub fn log_stats_delta(&self) {
+        let (entries_len, delta) = {
+            let mut inner = self.inner.lock();
+            (inner.entries.len(), inner.stats.take_delta())
+        };
+        if delta.is_all_zero() {
+            return;
+        }
+        tracing::info!(
+            "cache_meter stats entries_len={} capacity={} hits={} misses={} evicted={} expired={} \
+             miss_no_entry={} miss_expired={} miss_evicted={} miss_no_breakpoint={} \
+             miss_no_seed={} tombstone_clears={}",
+            entries_len,
+            self.capacity,
+            delta.hits,
+            delta.misses,
+            delta.evicted_total,
+            delta.expired_total,
+            delta.miss_no_entry,
+            delta.miss_expired,
+            delta.miss_evicted,
+            delta.miss_no_breakpoint,
+            delta.miss_no_seed,
+            delta.tombstone_clears,
+        );
+    }
+
     /// 读取 `KIRO_RS_CACHE_METERING` 环境变量表达的开关意图。
     ///
     /// `0` / `off` / `false` / `no` / `disabled`（大小写不敏感、自动 trim）为关闭，
@@ -489,15 +654,67 @@ impl CacheMeter {
     /// 生效优先级：config.json 显式值 > 本环境变量 > 默认开启。环境变量只作为
     /// 未落配置时的初值（适合全新 docker 部署），一旦从 UI 改过就以 config.json 为准。
     pub fn metering_enabled_from_env() -> Option<bool> {
-        let raw = std::env::var("KIRO_RS_CACHE_METERING").ok()?;
-        let raw = raw.trim().to_ascii_lowercase();
-        if raw.is_empty() {
-            return None;
+        bool_from_env("KIRO_RS_CACHE_METERING")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_CAPACITY` 表达的容量意图。
+    pub fn capacity_from_env() -> Option<usize> {
+        usize_from_env("KIRO_RS_CACHE_CAPACITY")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 表达的落盘间隔意图。
+    pub fn flush_interval_from_env() -> Option<u64> {
+        u64_from_env("KIRO_RS_CACHE_FLUSH_INTERVAL_SECS")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_PERSIST` 表达的落盘开关意图。
+    pub fn persist_enabled_from_env() -> Option<bool> {
+        bool_from_env("KIRO_RS_CACHE_PERSIST")
+    }
+
+    /// 读取 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 表达的 miss 归因开关意图。
+    pub fn miss_diagnostics_from_env() -> Option<bool> {
+        bool_from_env("KIRO_RS_CACHE_MISS_DIAGNOSTICS")
+    }
+
+    /// 按 `config.json > 环境变量 > 内置默认` 定出生效容量，并钳到
+    /// `[MIN_CAPACITY, MAX_CAPACITY]`。越界时 warn 出原值与生效值。
+    pub fn resolve_capacity(from_config: Option<usize>, from_env: Option<usize>) -> usize {
+        let raw = from_config
+            .filter(|v| *v > 0)
+            .or_else(|| from_env.filter(|v| *v > 0))
+            .unwrap_or(DEFAULT_CAPACITY);
+        let clamped = raw.clamp(MIN_CAPACITY, MAX_CAPACITY);
+        if clamped != raw {
+            tracing::warn!(
+                "cacheMeteringCapacity={} 越界 [{}, {}]，已钳制为 {}",
+                raw,
+                MIN_CAPACITY,
+                MAX_CAPACITY,
+                clamped
+            );
         }
-        Some(!matches!(
-            raw.as_str(),
-            "0" | "off" | "false" | "no" | "disabled"
-        ))
+        clamped
+    }
+
+    /// 按 `config.json > 环境变量 > 内置默认` 定出生效落盘间隔，并钳到
+    /// `[MIN_FLUSH_INTERVAL_SECS, MAX_FLUSH_INTERVAL_SECS]`。
+    pub fn resolve_flush_interval_secs(from_config: Option<u64>, from_env: Option<u64>) -> u64 {
+        let raw = from_config
+            .filter(|v| *v > 0)
+            .or_else(|| from_env.filter(|v| *v > 0))
+            .unwrap_or(DEFAULT_FLUSH_INTERVAL_SECS);
+        let clamped = raw.clamp(MIN_FLUSH_INTERVAL_SECS, MAX_FLUSH_INTERVAL_SECS);
+        if clamped != raw {
+            tracing::warn!(
+                "cacheMeteringFlushIntervalSecs={} 越界 [{}, {}]，已钳制为 {}",
+                raw,
+                MIN_FLUSH_INTERVAL_SECS,
+                MAX_FLUSH_INTERVAL_SECS,
+                clamped
+            );
+        }
+        clamped
     }
 
     /// 从环境变量 `KIRO_RS_CACHE_REDIS_URL` 初始化 CacheMeter。
@@ -531,11 +748,17 @@ impl CacheMeter {
         Self::with_remote(persist_path, remote)
     }
 
-    /// 查询单个哈希是否在缓存中且未过期。若命中则进行滑动续期（按 entry 自身 TTL），并返回 tokens。
-    pub fn lookup_and_renew(&self, hash: u64) -> Option<u32> {
+    /// 探测单个哈希，返回命中结果与 miss 归因。命中时按 entry 自身 TTL 滑动续期。
+    ///
+    /// **不碰任何计数器**：lookback 一个断点要探测多达 20 个 hash，
+    /// 逐个记账会把「一次成功命中」记成「多条 miss + 一条 hit」。
+    /// 业务计数统一由调用方在断点结束后调一次 `note_lookup`。
+    fn probe_outcome(&self, hash: u64) -> LookupOutcome {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let tokens = if let Some(entry) = inner.entries.get_mut(&hash) {
+
+        // 先结束对 entries 的可变借用，再去碰 tombstones / stats
+        let probe = inner.entries.get_mut(&hash).map(|entry| {
             if entry.expires_at > now {
                 let ttl = entry.ttl_secs.clamp(60, MAX_TTL_SECS);
                 entry.ttl_secs = ttl;
@@ -545,13 +768,94 @@ impl CacheMeter {
             } else {
                 None
             }
-        } else {
-            None
+        });
+
+        let outcome = match probe {
+            Some(Some(tokens)) => LookupOutcome::Hit(tokens),
+            Some(None) => LookupOutcome::Expired,
+            None => match inner.tombstones.get(&hash) {
+                Some(TombstoneKind::Expired) => LookupOutcome::Expired,
+                Some(TombstoneKind::Evicted) => LookupOutcome::Evicted,
+                None => LookupOutcome::Absent,
+            },
         };
-        if tokens.is_some() {
+
+        if matches!(outcome, LookupOutcome::Hit(_)) {
             inner.dirty = true;
         }
-        tokens
+
+        outcome
+    }
+
+    /// 给**一次业务查找**记一次账：命中记 1 次 `hits`，未命中按原因记 1 次
+    /// `misses` + 对应分项。一个断点无论探测过多少个 hash，只调用一次。
+    pub fn note_lookup(&self, outcome: LookupOutcome) {
+        let mut inner = self.inner.lock();
+        match outcome {
+            LookupOutcome::Hit(_) => inner.stats.add(|s| &mut s.hits, 1),
+            LookupOutcome::Expired => {
+                inner.stats.add(|s| &mut s.misses, 1);
+                inner.stats.add(|s| &mut s.miss_expired, 1);
+            }
+            LookupOutcome::Evicted => {
+                inner.stats.add(|s| &mut s.misses, 1);
+                inner.stats.add(|s| &mut s.miss_evicted, 1);
+            }
+            LookupOutcome::Absent => {
+                inner.stats.add(|s| &mut s.misses, 1);
+                inner.stats.add(|s| &mut s.miss_no_entry, 1);
+            }
+        }
+    }
+
+    /// 查一个哈希并记一次账。单 hash 查找（含 `lookup_and_renew`）走这里；
+    /// 多 hash 回溯探测请用 `probe_outcome` + 末尾一次 `note_lookup`。
+    #[allow(dead_code)]
+    pub fn lookup_outcome(&self, hash: u64) -> LookupOutcome {
+        let outcome = self.probe_outcome(hash);
+        self.note_lookup(outcome);
+        outcome
+    }
+
+    /// 查询单个哈希是否在缓存中且未过期。命中则滑动续期并返回 tokens。
+    /// 归因信息请用 `lookup_outcome`。
+    #[allow(dead_code)]
+    pub fn lookup_and_renew(&self, hash: u64) -> Option<u32> {
+        match self.lookup_outcome(hash) {
+            LookupOutcome::Hit(tokens) => Some(tokens),
+            _ => None,
+        }
+    }
+
+    /// 进程累计计数器快照。
+    pub fn stats_total(&self) -> StatsSnapshot {
+        self.inner.lock().stats.total
+    }
+
+    /// 取走本周期增量并清零（周期性日志用）。
+    #[allow(dead_code)]
+    pub fn take_stats_delta(&self) -> StatsSnapshot {
+        self.inner.lock().stats.take_delta()
+    }
+
+    /// 请求没有任何可用断点（无 cache_control / 超 MAX_BREAKPOINTS / 混合 TTL 顺序非法）。
+    pub fn note_miss_no_breakpoint(&self) {
+        {
+            let mut inner = self.inner.lock();
+            inner.stats.add(|s| &mut s.misses, 1);
+            inner.stats.add(|s| &mut s.miss_no_breakpoint, 1);
+        }
+        tracing::debug!("cache_meter miss reason=no_breakpoint");
+    }
+
+    /// 请求拿不到会话隔离种子（无 metadata.user_id 且 key_id == 0）。
+    pub fn note_miss_no_seed(&self) {
+        {
+            let mut inner = self.inner.lock();
+            inner.stats.add(|s| &mut s.misses, 1);
+            inner.stats.add(|s| &mut s.miss_no_seed, 1);
+        }
+        tracing::debug!("cache_meter miss reason=no_seed");
     }
 
     /// 写入单个断点条目，按指定的 ttl_secs 设置过期时间
@@ -568,22 +872,55 @@ impl CacheMeter {
                 last_hit_at: now,
             },
         );
+        inner.tombstones.remove(&hash);
         inner.dirty = true;
-        self.enforce_capacity(&mut inner);
+        // 「先过期、后容量」：过期条目必须记成 Expired/expired_total，
+        // 否则会被当成容量淘汰，污染 miss_evicted 这个容量诊断信号。
+        if inner.entries.len() > hard_limit(self.capacity) {
+            self.evict_expired_locked(&mut inner, now);
+            if inner.entries.len() > hard_limit(self.capacity) {
+                self.shrink_to_watermark(&mut inner);
+            }
+        }
     }
 
-    fn enforce_capacity(&self, inner: &mut Inner) {
-        if inner.entries.len() > DEFAULT_CAPACITY {
-            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
-            let mut victims: Vec<(u64, i64)> = inner
-                .entries
-                .iter()
-                .map(|(k, v)| (*k, v.last_hit_at))
-                .collect();
-            victims.sort_by_key(|x| x.1);
-            for (k, _) in victims.into_iter().take(drop_n) {
-                inner.entries.remove(&k);
-            }
+    /// 把表清到 `0.9 * capacity` 水位。单次 `O(n)`：用
+    /// `select_nth_unstable_by_key` 把 `last_hit_at` 最小的 drop_n 条划到前半段
+    /// （顺序不定、不需要有序），取代原来的 `O(n log n)` 全表排序。
+    ///
+    /// `last_hit_at` 相等时谁被淘汰不确定 —— LRU 本就是近似，接受。
+    fn shrink_to_watermark(&self, inner: &mut Inner) {
+        let target = watermark(self.capacity);
+        let len = inner.entries.len();
+        if len <= target {
+            return;
+        }
+        let drop_n = len - target;
+        let mut victims: Vec<(u64, i64)> = inner
+            .entries
+            .iter()
+            .map(|(k, v)| (*k, v.last_hit_at))
+            .collect();
+        // drop_n >= 1 由上面的早退保证，drop_n - 1 不会下溢
+        victims.select_nth_unstable_by_key(drop_n - 1, |x| x.1);
+        victims.truncate(drop_n);
+        let diagnostics = self.miss_diagnostics;
+        for (k, _) in victims {
+            inner.entries.remove(&k);
+            note_tombstone(inner, diagnostics, k, TombstoneKind::Evicted);
+        }
+        inner.stats.add(|s| &mut s.evicted_total, drop_n as u64);
+        inner.dirty = true;
+    }
+
+    /// 后台巡检一轮：先清过期，再在超过 `capacity` 时清到水位。
+    /// `record_entry` 的 `1.2C` 兜底只在突发写入快过本回收时才会触发。
+    pub fn sweep(&self) {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        self.evict_expired_locked(&mut inner, now);
+        if inner.entries.len() > self.capacity {
+            self.shrink_to_watermark(&mut inner);
         }
     }
 
@@ -616,36 +953,149 @@ impl CacheMeter {
         }
     }
 
-    /// 启动后台周期任务：定期 flush + 清理过期条目
+    /// 启动后台周期任务。
+    ///
+    /// **两个互相独立的定时器**：
+    /// - 巡检 `SWEEP_INTERVAL_SECS`（60 秒）一轮，做「清过期 + 水位检查 + 指标输出」；
+    /// - 落盘按 `flush_interval_secs`（10–3600 秒）自己计时。
+    ///
+    /// 不把落盘挂在巡检轮里判断「距上次够久没有」：那样 10 秒的配置实际最快 60 秒
+    /// 才落一次、90 秒的配置实际 120 秒，与对外声明的可配置区间不符。
+    /// 落盘关闭时该分支用 `select!` 的条件直接禁用，定时器不参与竞争。
     pub fn spawn_background(self: Arc<Self>) {
+        let sweep_period = std::time::Duration::from_secs(SWEEP_INTERVAL_SECS);
+        let flush_period = std::time::Duration::from_secs(self.flush_interval_secs);
+        let persist = self.persist_enabled();
         let weak = Arc::downgrade(&self);
+        drop(self);
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(60);
+            let mut sweep_tick = tokio::time::interval(sweep_period);
+            let mut flush_tick = tokio::time::interval(flush_period);
+            // interval 的第一次 tick 立刻返回，先吃掉，避免启动瞬间就落一次盘
+            sweep_tick.tick().await;
+            flush_tick.tick().await;
+            // 落后时补齐而不是追打一串 tick（进程被挂起/机器休眠后尤其重要）
+            sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tokio::time::sleep(interval).await;
-                let Some(cache) = weak.upgrade() else { return };
-                cache.evict_expired();
-                cache.flush_to_disk();
+                tokio::select! {
+                    _ = sweep_tick.tick() => {
+                        let Some(cache) = weak.upgrade() else { return };
+                        cache.sweep();
+                        cache.log_stats_delta();
+                    }
+                    _ = flush_tick.tick(), if persist => {
+                        let Some(cache) = weak.upgrade() else { return };
+                        cache.flush_to_disk();
+                    }
+                }
             }
         });
     }
 
-    /// 删除已过期条目（lookup 不命中过期时只是返回 miss，不会顺手清理；
-    /// 这里在后台周期里清一次，避免内存膨胀）。
+    /// 删除已过期条目（lookup 不命中过期时只是返回 miss，不会顺手清理）。
+    ///
+    /// 生产路径统一走 `sweep()` 与 `record_entry` 的强制回收，两者都直接调
+    /// `evict_expired_locked`；这里只保留给测试单独验证过期清理用。
+    #[cfg(test)]
     pub fn evict_expired(&self) {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let before = inner.entries.len();
-        inner.entries.retain(|_, v| v.expires_at > now);
-        if inner.entries.len() != before {
-            inner.dirty = true;
-        }
+        self.evict_expired_locked(&mut inner, now);
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// `evict_expired` 的持锁版本：后台巡检和 `record_entry` 的强制回收共用，
+    /// 保证两条路径的归因顺序一致（先 Expired，后 Evicted），也避免在已持锁时
+    /// 再去调用会重新加锁的 `evict_expired()`。
+    fn evict_expired_locked(&self, inner: &mut Inner, now: i64) {
+        let dead: Vec<u64> = inner
+            .entries
+            .iter()
+            .filter(|(_, v)| v.expires_at <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        let diagnostics = self.miss_diagnostics;
+        for k in &dead {
+            inner.entries.remove(k);
+            note_tombstone(inner, diagnostics, *k, TombstoneKind::Expired);
+        }
+        inner.stats.add(|s| &mut s.expired_total, dead.len() as u64);
+        inner.dirty = true;
+    }
+
+    /// 当前表内条目数（含已过期但尚未被清理的）。
+    pub fn len(&self) -> usize {
         self.inner.lock().entries.len()
     }
+
+    /// 表是否为空（clippy 要求与 `len` 成对）。
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 记一条墓碑。超过硬上限时整表清空并把 `tombstone_clears` +1。
+fn note_tombstone(inner: &mut Inner, enabled: bool, hash: u64, kind: TombstoneKind) {
+    if !enabled {
+        return;
+    }
+    if inner.tombstones.len() >= TOMBSTONE_CAPACITY {
+        inner.tombstones.clear();
+        inner.stats.add(|s| &mut s.tombstone_clears, 1);
+    }
+    inner.tombstones.insert(hash, kind);
+}
+
+/// `record_entry` 的强制淘汰触发线：`capacity * 1.2`。
+fn hard_limit(capacity: usize) -> usize {
+    capacity.saturating_mul(6) / 5
+}
+
+/// 一次淘汰清到的目标水位：`capacity * 0.9`。
+fn watermark(capacity: usize) -> usize {
+    capacity / 10 * 9
+}
+
+/// 解析布尔型环境变量：`0/off/false/no/disabled` 为假，其余非空为真，空串/未设置返回 None。
+fn bool_from_env(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    let raw = raw.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(!matches!(
+        raw.as_str(),
+        "0" | "off" | "false" | "no" | "disabled"
+    ))
+}
+
+/// 解析 usize 型环境变量。解析失败、为 0、为空串一律视为「未表态」并 warn，不 panic。
+fn usize_from_env(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse::<usize>() {
+        Ok(0) => {
+            tracing::warn!("环境变量 {}=0 无效，已忽略并回落到默认值", name);
+            None
+        }
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!("环境变量 {}={:?} 不是合法正整数，已忽略", name, raw);
+            None
+        }
+    }
+}
+
+/// 解析 u64 型环境变量，口径与 `usize_from_env` 一致。
+fn u64_from_env(name: &str) -> Option<u64> {
+    usize_from_env(name).map(|v| v as u64)
 }
 
 fn now_secs() -> i64 {
@@ -826,7 +1276,10 @@ fn resolve_breakpoints(
         let Some(auto_ttl) = validated_ttl(top_cc) else {
             return Vec::new();
         };
-        let target_idx = if blocks.iter().any(|b| !b.is_current_turn_input && b.cacheable) {
+        let target_idx = if blocks
+            .iter()
+            .any(|b| !b.is_current_turn_input && b.cacheable)
+        {
             blocks
                 .iter()
                 .enumerate()
@@ -898,6 +1351,7 @@ pub async fn compute_cache_usage(
     let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
     if breakpoints.is_empty() {
         // 无断点：官方不会缓存，全部计入 input
+        cache.note_miss_no_breakpoint();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -906,6 +1360,7 @@ pub async fn compute_cache_usage(
 
     // 会话隔离种子
     let Some(seed) = isolation_seed(req, key_id) else {
+        cache.note_miss_no_seed();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -938,6 +1393,12 @@ pub async fn compute_cache_usage(
 
     for bp in &breakpoints {
         let start_idx = lookback_start_index(&blocks, bp.block_idx);
+        // 归因取最深那个 hash（第一次探测）的判定结果 —— 它才是本可命中的那一条
+        let mut deepest_reason = LookupOutcome::Absent;
+        // 一个断点只记一次账：探测期间一律用不计数的 probe_outcome，
+        // 循环结束后按最终结果调一次 note_lookup。
+        let mut hit_tokens_final: Option<u32> = None;
+
         for check_idx in (start_idx..=bp.block_idx).rev() {
             let hash = cum_hashes[check_idx];
             let mut hit_tokens = None;
@@ -953,7 +1414,13 @@ pub async fn compute_cache_usage(
 
             // 若远端未配置或 miss / 出错降级，查本地
             if hit_tokens.is_none() {
-                hit_tokens = cache.lookup_and_renew(hash);
+                let outcome = cache.probe_outcome(hash);
+                if check_idx == bp.block_idx {
+                    deepest_reason = outcome;
+                }
+                if let LookupOutcome::Hit(tokens) = outcome {
+                    hit_tokens = Some(tokens);
+                }
             }
 
             if let Some(tokens) = hit_tokens {
@@ -961,7 +1428,23 @@ pub async fn compute_cache_usage(
                     max_read_tokens = tokens;
                 }
                 // 当前断点已找到最深命中，不必继续向更浅的 block 回溯
+                hit_tokens_final = Some(tokens);
                 break;
+            }
+        }
+
+        match hit_tokens_final {
+            // 本地或远端命中都走这里：一个断点记 1 次 hit
+            Some(tokens) => cache.note_lookup(LookupOutcome::Hit(tokens)),
+            None => {
+                // 全部落空：记 1 次 miss，原因取最深那次探测的判定
+                cache.note_lookup(deepest_reason);
+                tracing::debug!(
+                    "cache_meter miss block_idx={} reason={:?} ttl={}",
+                    bp.block_idx,
+                    deepest_reason,
+                    bp.ttl_secs
+                );
             }
         }
     }
@@ -1014,6 +1497,7 @@ pub fn compute_cache_usage_sync(
     // 解析断点（显式 + 顶层自动）
     let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
     if breakpoints.is_empty() {
+        cache.note_miss_no_breakpoint();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -1021,6 +1505,7 @@ pub fn compute_cache_usage_sync(
     }
 
     let Some(seed) = isolation_seed(req, key_id) else {
+        cache.note_miss_no_seed();
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
             ..Default::default()
@@ -1051,13 +1536,35 @@ pub fn compute_cache_usage_sync(
 
     for bp in &breakpoints {
         let start_idx = lookback_start_index(&blocks, bp.block_idx);
+        // 归因取最深那个 hash（第一次探测）的判定结果
+        let mut deepest_reason = LookupOutcome::Absent;
+        let mut hit_tokens_final: Option<u32> = None;
+
         for check_idx in (start_idx..=bp.block_idx).rev() {
             let hash = cum_hashes[check_idx];
-            if let Some(tokens) = cache.lookup_and_renew(hash) {
+            let outcome = cache.probe_outcome(hash);
+            if check_idx == bp.block_idx {
+                deepest_reason = outcome;
+            }
+            if let LookupOutcome::Hit(tokens) = outcome {
                 if tokens > max_read_tokens {
                     max_read_tokens = tokens;
                 }
+                hit_tokens_final = Some(tokens);
                 break;
+            }
+        }
+
+        match hit_tokens_final {
+            Some(tokens) => cache.note_lookup(LookupOutcome::Hit(tokens)),
+            None => {
+                cache.note_lookup(deepest_reason);
+                tracing::debug!(
+                    "cache_meter miss block_idx={} reason={:?} ttl={}",
+                    bp.block_idx,
+                    deepest_reason,
+                    bp.ttl_secs
+                );
             }
         }
     }
@@ -1100,20 +1607,26 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     Some(format!("key:{key_id}"))
 }
 
-/// 从 Claude Code 的 user_id 中提取 session 标识。
+/// 从客户端的 user_id 中提取 session 标识。
+///
+/// 支持两种形态：
+/// 1. JSON 对象：`{"device_id":"...","account_uuid":"...","session_id":"<uuid>"}`，取 `session_id`。
+/// 2. 字符串：Claude Code 的 `..._session_<uuid>` 或 OpenAI/Codex 的 `session_<uuid>`，
+///    取 `session_` 之后的部分。
 fn extract_session_id(user_id: &str) -> Option<String> {
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
-        && let Some(sid) = json
+    // JSON 形态优先。合法 JSON 缺少 session_id 时不能回退字符串匹配，否则会把
+    // `"session_id":""` 中的 `session_` 误判为会话标识。
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+        return json
             .get("session_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-    {
-        return Some(sid.to_string());
+            .map(str::to_string);
     }
 
     user_id
-        .split_once("_session_")
+        .split_once("session_")
         .map(|(_, sid)| sid.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -2896,6 +3409,68 @@ mod tests {
         assert_eq!(extract_session_id("trailing_session_"), None);
     }
 
+    /// OpenAI/Codex 的 user_id 形如 `session_<uuid>`，前面没有下划线。
+    #[test]
+    fn extract_session_id_parses_codex_format() {
+        assert_eq!(
+            extract_session_id("session_550e8400-e29b-41d4-a716-446655440000"),
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    /// Codex 共享主 Key（key_id=0）时靠 session 隔离：不同 session 不命中，相同命中。
+    #[test]
+    fn codex_session_scopes_cache_with_master_key() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, Metadata};
+        let body = "conversation prefix that stays stable ".repeat(20);
+        let make = |session: &str| MessagesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("session_{session}")),
+            }),
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        };
+
+        let cache = CacheMeter::new(None);
+        assert_eq!(
+            compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read,
+            0
+        );
+        assert_eq!(
+            compute_cache_usage_sync(&cache, &make("bbb"), 0).cache_read,
+            0,
+            "不同 session 不应命中"
+        );
+        assert!(
+            compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read > 0,
+            "相同 session 应命中"
+        );
+    }
+
     #[test]
     fn extract_session_id_parses_json_format() {
         let user_id = r#"{"device_id":"2721550240e8e5303fa95053fab0666443ab2b2ea79c2fc67bb6ff336f1297a9","account_uuid":"","session_id":"c479866d-b846-4e87-807b-a5ed0d84948c"}"#;
@@ -3182,5 +3757,723 @@ mod tests {
         assert_eq!(read, 100_000, "命中前缀必须全额如实上报");
         assert_eq!(creation, 0, "无新增覆盖段");
         assert_eq!(input, 1_000, "最新提问如实计入 input");
+    }
+
+    /// 测试内改环境变量会互相干扰，所有碰 env 的测试共用这把锁。
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn capacity_from_config_overrides_env() {
+        // config 显式值 > 环境变量 > 内置默认
+        assert_eq!(
+            CacheMeter::resolve_capacity(Some(8_192), Some(4_096)),
+            8_192
+        );
+        assert_eq!(CacheMeter::resolve_capacity(None, Some(4_096)), 4_096);
+        assert_eq!(CacheMeter::resolve_capacity(None, None), DEFAULT_CAPACITY);
+        assert_eq!(DEFAULT_CAPACITY, 262_144, "默认容量提高到 262144");
+    }
+
+    #[test]
+    fn capacity_invalid_env_falls_back_with_warning() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        for bad in ["abc", "0", "   ", "-1", "1.5"] {
+            unsafe {
+                std::env::set_var("KIRO_RS_CACHE_CAPACITY", bad);
+            }
+            assert_eq!(
+                CacheMeter::capacity_from_env(),
+                None,
+                "{bad:?} 应被视为未表态而不是 panic"
+            );
+        }
+        unsafe {
+            std::env::set_var("KIRO_RS_CACHE_CAPACITY", "20000");
+        }
+        assert_eq!(CacheMeter::capacity_from_env(), Some(20_000));
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_CAPACITY");
+        }
+        assert_eq!(CacheMeter::capacity_from_env(), None, "未设置时不表态");
+        // 未表态时回落默认
+        assert_eq!(
+            CacheMeter::resolve_capacity(None, CacheMeter::capacity_from_env()),
+            DEFAULT_CAPACITY
+        );
+    }
+
+    #[test]
+    fn capacity_out_of_range_is_clamped() {
+        assert_eq!(CacheMeter::resolve_capacity(Some(100), None), 1_024);
+        assert_eq!(
+            CacheMeter::resolve_capacity(Some(99_999_999), None),
+            8_388_608
+        );
+        assert_eq!(CacheMeter::resolve_capacity(None, Some(100)), 1_024);
+        assert_eq!(CacheMeter::resolve_capacity(Some(65_536), None), 65_536);
+    }
+
+    #[test]
+    fn flush_interval_clamped() {
+        assert_eq!(CacheMeter::resolve_flush_interval_secs(Some(1), None), 10);
+        assert_eq!(
+            CacheMeter::resolve_flush_interval_secs(Some(99_999), None),
+            3_600
+        );
+        assert_eq!(
+            CacheMeter::resolve_flush_interval_secs(None, Some(600)),
+            600
+        );
+        assert_eq!(
+            CacheMeter::resolve_flush_interval_secs(None, None),
+            DEFAULT_FLUSH_INTERVAL_SECS
+        );
+        assert_eq!(DEFAULT_FLUSH_INTERVAL_SECS, 300);
+    }
+
+    #[test]
+    fn persist_and_diagnostics_env_parsing() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("KIRO_RS_CACHE_PERSIST", "TRUE");
+            std::env::set_var("KIRO_RS_CACHE_MISS_DIAGNOSTICS", " off ");
+        }
+        assert_eq!(CacheMeter::persist_enabled_from_env(), Some(true));
+        assert_eq!(CacheMeter::miss_diagnostics_from_env(), Some(false));
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_PERSIST");
+            std::env::remove_var("KIRO_RS_CACHE_MISS_DIAGNOSTICS");
+        }
+        assert_eq!(CacheMeter::persist_enabled_from_env(), None);
+        assert_eq!(CacheMeter::miss_diagnostics_from_env(), None);
+    }
+
+    /// 构造一个容量确定、last_hit_at 可控的 meter。
+    ///
+    /// 注意：`with_capacity` 自己会把入参钳到 `[MIN_CAPACITY, MAX_CAPACITY]`，
+    /// 所以这里只能传 **≥ 1024** 的合法容量。
+    fn meter_with_capacity(capacity: usize) -> CacheMeter {
+        let cache = CacheMeter::new(None).with_capacity(capacity);
+        assert_eq!(cache.capacity(), capacity, "测试容量必须落在合法区间内");
+        cache
+    }
+
+    #[test]
+    fn record_entry_does_not_evict_below_hard_ratio() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_300u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), 2_300, "未越过 1.2C(=2400) 硬顶，不应强制淘汰");
+    }
+
+    #[test]
+    fn record_entry_shrinks_to_watermark_above_hard_ratio() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_401u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(
+            cache.len(),
+            1_800,
+            "越过 1.2C(=2400) 应一次清到 0.9C(=1800)"
+        );
+    }
+
+    #[test]
+    fn shrink_evicts_least_recently_hit_first() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_400u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        // 下面再插一条就是 2401 条，淘汰量正好 601（2401 - 0.9*2000），
+        // 所以「很久以前」那组也要正好 601 条，否则 last_hit_at 相同的条目之间
+        // 会出现不确定的 tie-break，断言不稳。
+        // 0..1799 标成最近命中（1799 条），1799..2400 标成很久以前（601 条）。
+        {
+            let mut inner = cache.inner.lock();
+            let now = now_secs();
+            for (k, v) in inner.entries.iter_mut() {
+                v.last_hit_at = if *k < 1_799 { now } else { now - 10_000 };
+            }
+        }
+        // 再插一条（last_hit_at = now，属于最近组）越过 1.2C 硬顶：2401 > 2400
+        cache.record_entry(9_999, 1, 300);
+        assert_eq!(cache.len(), 1_800);
+        let inner = cache.inner.lock();
+        for k in 0..1_799u64 {
+            assert!(inner.entries.contains_key(&k), "最近命中的 {k} 不该被淘汰");
+        }
+        assert!(inner.entries.contains_key(&9_999), "刚写入的条目不该被淘汰");
+        for k in 1_799..2_400u64 {
+            assert!(!inner.entries.contains_key(&k), "最久未命中的 {k} 应被淘汰");
+        }
+    }
+
+    #[test]
+    fn background_sweep_shrinks_above_capacity() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_100u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), 2_100, "1.0C~1.2C 之间 record_entry 不动手");
+        cache.sweep();
+        assert_eq!(cache.len(), 1_800, "后台巡检应把超过 1.0C 的表清到 0.9C");
+    }
+
+    /// Review Focus 2：capacity 取下限时 drop_n-1 == 0 与 saturating_mul 的边界。
+    #[test]
+    fn shrink_handles_minimum_capacity_without_panic() {
+        let cache = meter_with_capacity(MIN_CAPACITY);
+        // 刚好越过硬顶一条：len = 1024*6/5 + 1 = 1229
+        for i in 0..1_229u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), MIN_CAPACITY / 10 * 9);
+        // 上限不溢出
+        assert_eq!(hard_limit(MAX_CAPACITY), MAX_CAPACITY * 6 / 5);
+        assert_eq!(hard_limit(usize::MAX), usize::MAX / 5);
+        // 单条越过水位时 drop_n == 1，select_nth_unstable_by_key(0, ..) 必须合法。
+        // 注意不能用 sweep()：len = watermark + 1 = 922 还没超过 capacity(1024)，
+        // sweep 会直接早退、根本不触发淘汰，覆盖不到这个边界。必须直接调
+        // shrink_to_watermark（同模块子 mod，可访问私有方法）。
+        let tiny = meter_with_capacity(MIN_CAPACITY);
+        let target = watermark(MIN_CAPACITY);
+        for i in 0..(target + 1) as u64 {
+            tiny.record_entry(i, 1, 300);
+        }
+        assert_eq!(tiny.len(), target + 1, "此时还没到 capacity，不该自发淘汰");
+        {
+            let mut inner = tiny.inner.lock();
+            tiny.shrink_to_watermark(&mut inner);
+        }
+        assert_eq!(tiny.len(), target, "drop_n == 1 的边界必须正好清掉一条");
+    }
+
+    #[test]
+    fn lookup_outcome_expired_vs_absent() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_outcome(1), LookupOutcome::Absent, "从未写过");
+        cache.record_entry(1, 7, 300);
+        assert_eq!(cache.lookup_outcome(1), LookupOutcome::Hit(7));
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&1).unwrap().expires_at = now_secs() - 1;
+        }
+        assert_eq!(
+            cache.lookup_outcome(1),
+            LookupOutcome::Expired,
+            "表里还在但已过期"
+        );
+    }
+
+    #[test]
+    fn stats_counters_accumulate_on_hit_and_miss() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_and_renew(1), None);
+        cache.record_entry(1, 10, 300);
+        assert_eq!(cache.lookup_and_renew(1), Some(10));
+
+        let stats = cache.stats_total();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.miss_no_entry, 1);
+        assert_eq!(stats.miss_expired, 0);
+    }
+
+    #[test]
+    fn stats_delta_resets_but_total_keeps() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_and_renew(1), None);
+        let first = cache.take_stats_delta();
+        assert_eq!(first.misses, 1);
+        let second = cache.take_stats_delta();
+        assert!(second.is_all_zero(), "增量取走后应清零");
+        assert_eq!(cache.stats_total().misses, 1, "累计量不随增量清零");
+    }
+
+    #[test]
+    fn evict_and_shrink_bump_totals() {
+        let cache = CacheMeter::new(None).with_capacity(MIN_CAPACITY);
+        cache.record_entry(1, 5, 60);
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&1).unwrap().expires_at = now_secs() - 1;
+        }
+        cache.evict_expired();
+        assert_eq!(cache.stats_total().expired_total, 1);
+
+        for i in 0..(hard_limit(MIN_CAPACITY) as u64 + 1) {
+            cache.record_entry(100_000 + i, 1, 300);
+        }
+        assert!(cache.stats_total().evicted_total > 0, "强制淘汰应计数");
+    }
+
+    #[test]
+    fn shrink_records_evicted_tombstone() {
+        let cache = CacheMeter::new(None).with_capacity(MIN_CAPACITY);
+        for i in 0..(hard_limit(MIN_CAPACITY) as u64 + 1) {
+            cache.record_entry(i, 1, 300);
+        }
+        // 被淘汰的那批里至少有一个 hash 能查到 Evicted
+        let evicted_seen = (0..(hard_limit(MIN_CAPACITY) as u64 + 1))
+            .any(|i| cache.lookup_outcome(i) == LookupOutcome::Evicted);
+        assert!(evicted_seen, "容量淘汰应留下 Evicted 墓碑");
+    }
+
+    #[test]
+    fn evict_expired_records_expired_tombstone() {
+        let cache = CacheMeter::new(None);
+        cache.record_entry(5, 1, 60);
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&5).unwrap().expires_at = now_secs() - 1;
+        }
+        cache.evict_expired();
+        assert_eq!(cache.lookup_outcome(5), LookupOutcome::Expired);
+        assert_eq!(cache.stats_total().miss_expired, 1);
+    }
+
+    /// 强制回收必须「先过期、后容量」：过期条目不能被记成容量淘汰，
+    /// 否则 README 的容量诊断会被 `miss_evicted` 误导。
+    #[test]
+    fn forced_reclaim_expires_before_evicting() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_400u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        // 把其中 800 条标成已过期
+        {
+            let mut inner = cache.inner.lock();
+            let past = now_secs() - 1;
+            for k in 0..800u64 {
+                inner.entries.get_mut(&k).unwrap().expires_at = past;
+            }
+        }
+        // 第 2401 条越过 1.2C(=2400) 硬顶
+        cache.record_entry(9_999, 1, 300);
+
+        assert_eq!(
+            cache.len(),
+            1_601,
+            "清掉 800 条过期后 1601 条已低于硬顶，不该再做容量淘汰"
+        );
+        let stats = cache.stats_total();
+        assert_eq!(stats.expired_total, 800, "过期条目应记为 expired_total");
+        assert_eq!(stats.evicted_total, 0, "没有条目因容量被淘汰");
+        assert_eq!(
+            cache.lookup_outcome(0),
+            LookupOutcome::Expired,
+            "过期条目应留下 Expired 墓碑而非 Evicted"
+        );
+        assert!(
+            cache.inner.lock().entries.contains_key(&9_999),
+            "刚写入的条目必须还在"
+        );
+    }
+
+    /// 清完过期后仍超硬顶时，剩下的缺口才按容量淘汰。
+    #[test]
+    fn forced_reclaim_still_evicts_when_expiry_is_not_enough() {
+        let cache = meter_with_capacity(2_000);
+        for i in 0..2_400u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        {
+            let mut inner = cache.inner.lock();
+            let past = now_secs() - 1;
+            for k in 0..100u64 {
+                inner.entries.get_mut(&k).unwrap().expires_at = past;
+            }
+        }
+        cache.record_entry(9_999, 1, 300);
+
+        // 2401 - 100 = 2301 已低于硬顶，这一轮不做容量淘汰
+        assert_eq!(cache.len(), 2_301);
+        // 再写到 2401 条，此时无过期可清，只能走容量淘汰
+        for i in 10_000..10_100u64 {
+            cache.record_entry(i, 1, 300);
+        }
+        assert_eq!(cache.len(), 1_800, "无过期可清时应清到 0.9C");
+        let stats = cache.stats_total();
+        assert_eq!(stats.expired_total, 100);
+        assert_eq!(stats.evicted_total, 601, "2401 - 1800 = 601 条容量淘汰");
+    }
+
+    #[test]
+    fn tombstones_are_capped_and_cleared() {
+        let cache = CacheMeter::new(None).with_capacity(MIN_CAPACITY);
+        // 每轮插满越过硬顶，反复触发淘汰，累计淘汰量远超 TOMBSTONE_CAPACITY
+        let mut next: u64 = 0;
+        for _ in 0..80 {
+            for _ in 0..hard_limit(MIN_CAPACITY) {
+                cache.record_entry(next, 1, 300);
+                next += 1;
+            }
+        }
+        let inner = cache.inner.lock();
+        assert!(
+            inner.tombstones.len() <= TOMBSTONE_CAPACITY,
+            "墓碑表必须有硬上限，实际 {}",
+            inner.tombstones.len()
+        );
+        assert!(
+            inner.stats.total.tombstone_clears >= 1,
+            "超限应整表清空并计数"
+        );
+    }
+
+    #[test]
+    fn miss_diagnostics_disabled_keeps_tombstones_empty() {
+        let cache = CacheMeter::new(None)
+            .with_capacity(MIN_CAPACITY)
+            .with_miss_diagnostics(false);
+        for i in 0..(hard_limit(MIN_CAPACITY) as u64 + 1) {
+            cache.record_entry(i, 1, 300);
+        }
+        assert!(cache.inner.lock().tombstones.is_empty(), "关闭后不建墓碑表");
+        // 被淘汰的条目退化为 Absent
+        let evicted_seen = (0..(hard_limit(MIN_CAPACITY) as u64 + 1))
+            .any(|i| cache.lookup_outcome(i) == LookupOutcome::Evicted);
+        assert!(!evicted_seen, "关闭后不应产出 Evicted");
+        assert!(
+            cache.stats_total().miss_no_entry > 0,
+            "退化为 miss_no_entry"
+        );
+        assert_eq!(cache.stats_total().miss_evicted, 0);
+    }
+
+    /// Review Focus 5：条目被重新写入后，同 hash 的旧墓碑必须消失。
+    #[test]
+    fn record_entry_clears_stale_tombstone() {
+        let cache = CacheMeter::new(None);
+        cache.record_entry(42, 1, 60);
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.get_mut(&42).unwrap().expires_at = now_secs() - 1;
+        }
+        cache.evict_expired();
+        assert_eq!(cache.lookup_outcome(42), LookupOutcome::Expired);
+
+        cache.record_entry(42, 99, 300);
+        assert_eq!(cache.lookup_outcome(42), LookupOutcome::Hit(99));
+        assert!(
+            !cache.inner.lock().tombstones.contains_key(&42),
+            "重新写入后旧墓碑必须被删除，否则下次淘汰归因会串"
+        );
+    }
+
+    /// 构造一个完全没有 cache_control 的请求（无断点）。
+    fn build_request_without_breakpoint() -> MessagesRequest {
+        use super::super::types::Message;
+        MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("Hello".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_cache_usage_counts_miss_no_breakpoint() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_without_breakpoint();
+        let usage = compute_cache_usage(&cache, &req, 1).await;
+        assert_eq!(usage.cache_read, 0);
+        assert!(usage.prompt_total_est > 0);
+        let stats = cache.stats_total();
+        assert_eq!(stats.miss_no_breakpoint, 1);
+        assert_eq!(stats.miss_no_seed, 0);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn compute_cache_usage_counts_miss_no_seed() {
+        // 有断点但 key_id == 0 且没有 metadata.user_id → isolation_seed 返回 None
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+        let usage = compute_cache_usage(&cache, &req, 0).await;
+        assert_eq!(usage.cache_read, 0);
+        let stats = cache.stats_total();
+        assert_eq!(stats.miss_no_seed, 1);
+        assert_eq!(stats.miss_no_breakpoint, 0);
+        assert_eq!(stats.misses, 1);
+    }
+
+    /// Review Focus 3：远端命中走 remote 路径，必须记成 hit，不能记成 miss。
+    #[tokio::test]
+    async fn remote_hit_counts_as_hit_not_miss() {
+        let remote = Arc::new(FakeRemoteStore::default());
+        let cache = CacheMeter::with_remote(None, Some(remote.clone()));
+        let req = build_request_with_system_breakpoint();
+
+        // 第一次：本地远端都 miss，写入两边
+        let _ = compute_cache_usage(&cache, &req, 1).await;
+        let after_cold = cache.stats_total();
+        assert!(after_cold.misses > 0);
+
+        // 清掉本地表（墓碑一并清），只留远端 → 下一次必须走远端命中
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.clear();
+            inner.tombstones.clear();
+        }
+        let before = cache.stats_total();
+        let warm = compute_cache_usage(&cache, &req, 1).await;
+        let after = cache.stats_total();
+
+        assert!(warm.cache_read > 0, "应从远端命中");
+        assert_eq!(after.hits, before.hits + 1, "远端命中必须计 1 次 hit");
+        assert_eq!(after.misses, before.misses, "远端命中不得计入 misses");
+    }
+
+    /// 构造 user 消息为 text block 数组的请求。
+    /// `bp_on_first = true`：只有第 0 块、断点在第 0 块（用来预热浅层前缀）。
+    /// `bp_on_first = false`：第 0、1 两块、断点在第 1 块 —— 它的 lookback 能回溯到
+    /// 第 0 块，正是「深层不存在、浅层命中」要用的形状。两者第 0 块内容完全一致，
+    /// 所以 cum_hash[0] 相同。
+    fn build_request_with_two_blocks(bp_on_first: bool) -> MessagesRequest {
+        use super::super::types::Message;
+        let cc = serde_json::json!({"type": "ephemeral"});
+        let mut first = serde_json::json!({"type": "text", "text": "A".repeat(400)});
+        let mut second = serde_json::json!({"type": "text", "text": "B".repeat(400)});
+        if bp_on_first {
+            first["cache_control"] = cc;
+        } else {
+            second["cache_control"] = cc;
+        }
+        let content = if bp_on_first {
+            serde_json::Value::Array(vec![first])
+        } else {
+            serde_json::Value::Array(vec![first, second])
+        };
+        MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content,
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    /// 全部落空：一个断点探测多个 hash 也只记 **1 次** miss。
+    #[test]
+    fn lookback_all_miss_counts_one_miss_per_breakpoint() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(usage.cache_read, 0, "冷启动不该有 read");
+
+        let stats = cache.stats_total();
+        assert_eq!(stats.misses, 1, "一个断点只记一次 miss，不是每次探测一条");
+        assert_eq!(stats.miss_no_entry, 1);
+        assert_eq!(stats.hits, 0);
+    }
+
+    /// 深层不存在、浅层命中：记 1 次 hit、0 次 miss。
+    #[test]
+    fn lookback_deep_miss_shallow_hit_counts_one_hit_only() {
+        let cache = CacheMeter::new(None);
+        // 先用「断点在第 0 块」的请求写入浅层前缀
+        let seed_req = build_request_with_two_blocks(true);
+        let _ = compute_cache_usage_sync(&cache, &seed_req, 1);
+        let before = cache.stats_total();
+
+        // 再用「断点在第 1 块」的请求：最深 hash 没写过，回溯到第 0 块命中
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert!(usage.cache_read > 0, "应回溯命中浅层前缀");
+
+        let after = cache.stats_total();
+        assert_eq!(after.hits, before.hits + 1, "一次成功命中只记 1 次 hit");
+        assert_eq!(
+            after.misses, before.misses,
+            "命中的断点不得同时记 miss —— 深层探测落空不是业务 miss"
+        );
+    }
+
+    /// 远端路径下同样成立：深层落空、浅层命中只记 1 次 hit。
+    #[tokio::test]
+    async fn lookback_deep_miss_shallow_hit_counts_one_hit_remote() {
+        let remote = Arc::new(FakeRemoteStore::default());
+        let cache = CacheMeter::with_remote(None, Some(remote.clone()));
+        let seed_req = build_request_with_two_blocks(true);
+        let _ = compute_cache_usage(&cache, &seed_req, 1).await;
+
+        // 清掉本地表，强制走远端
+        {
+            let mut inner = cache.inner.lock();
+            inner.entries.clear();
+            inner.tombstones.clear();
+        }
+        let before = cache.stats_total();
+        let req = build_request_with_two_blocks(false);
+        let usage = compute_cache_usage(&cache, &req, 1).await;
+
+        assert!(usage.cache_read > 0, "应从远端回溯命中");
+        let after = cache.stats_total();
+        assert_eq!(after.hits, before.hits + 1);
+        assert_eq!(after.misses, before.misses);
+    }
+
+    #[test]
+    fn persist_disabled_does_not_read_or_write_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kiro-pc-off-{}-{}.json",
+            now_secs(),
+            fastrand::u64(..)
+        ));
+        // 预置一份有效快照
+        let seeded = CacheMeter::new(Some(tmp.clone()));
+        seeded.record_entry(7, 42, 600);
+        seeded.flush_to_disk();
+        let before = std::fs::read(&tmp).expect("预置快照应存在");
+        assert!(!before.is_empty());
+
+        // persist 关闭（persist_path = None）：不读
+        let off = CacheMeter::new(None);
+        assert_eq!(off.len(), 0, "关闭后启动不应加载任何条目");
+        assert!(!off.persist_enabled());
+
+        // 不写：跑完一轮落盘后文件字节不变
+        off.record_entry(1, 1, 300);
+        off.flush_to_disk();
+        let after = std::fs::read(&tmp).expect("关闭后不得删除已有文件");
+        assert_eq!(before, after, "关闭后不得改写已有快照文件");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Review Focus 1：快照格式不变，旧版本写的文件必须仍能加载。
+    #[test]
+    fn legacy_snapshot_format_still_loads() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kiro-pc-legacy-{}-{}.json",
+            now_secs(),
+            fastrand::u64(..)
+        ));
+        let future = now_secs() + 600;
+        let legacy = format!(
+            r#"{{"7":{{"tokens":42,"ttl_secs":600,"expires_at":{future},"last_hit_at":{future}}}}}"#
+        );
+        std::fs::write(&tmp, legacy).unwrap();
+
+        let cache = CacheMeter::new(Some(tmp.clone()));
+        assert_eq!(
+            cache.lookup_and_renew(7),
+            Some(42),
+            "旧格式快照必须仍能加载：序列化结构只含 entries"
+        );
+
+        // 回写后仍是同一结构（顶层对象的值里不得出现 tombstones / stats）
+        cache.record_entry(8, 1, 300);
+        cache.flush_to_disk();
+        let raw = std::fs::read_to_string(&tmp).unwrap();
+        assert!(!raw.contains("tombstones"), "墓碑不得落盘");
+        assert!(!raw.contains("miss_no_entry"), "计数器不得落盘");
+        let reread = CacheMeter::new(Some(tmp.clone()));
+        assert_eq!(reread.lookup_and_renew(8), Some(1));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn flush_interval_builder_round_trips() {
+        let cache = CacheMeter::new(None).with_flush_interval_secs(600);
+        assert_eq!(cache.flush_interval_secs(), 600);
+        // 钳制：builder 自身也兜一次底
+        let low = CacheMeter::new(None).with_flush_interval_secs(1);
+        assert_eq!(low.flush_interval_secs(), MIN_FLUSH_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn log_stats_delta_consumes_the_delta() {
+        let cache = CacheMeter::new(None);
+        assert_eq!(cache.lookup_and_renew(1), None);
+        cache.log_stats_delta();
+        assert!(cache.take_stats_delta().is_all_zero(), "输出后增量应被清零");
+        assert_eq!(cache.stats_total().misses, 1, "累计量保留");
+    }
+
+    /// 落盘定时器必须独立于 60 秒巡检：配 10 秒就要在 10 秒量级落盘，
+    /// 配 90 秒就要在 90 秒落盘（而不是被巡检对齐到 60/120 秒）。
+    /// 用 tokio 的虚拟时钟，不真的等。
+    async fn flush_count_within(interval_secs: u64, advance_secs: u64, persist: bool) -> usize {
+        let tmp = std::env::temp_dir().join(format!(
+            "kiro-pc-sched-{}-{}-{}.json",
+            interval_secs,
+            advance_secs,
+            fastrand::u64(..)
+        ));
+        let path = if persist { Some(tmp.clone()) } else { None };
+        let cache = Arc::new(CacheMeter::new(path).with_flush_interval_secs(interval_secs));
+        cache.record_entry(1, 10, 3_600);
+        cache.clone().spawn_background();
+
+        let mut writes = 0usize;
+        let mut last: Option<std::time::SystemTime> = None;
+        let mut seen = false;
+        for _ in 0..advance_secs {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            // 让后台任务有机会被调度
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            if let Ok(meta) = std::fs::metadata(&tmp) {
+                let mtime = meta.modified().ok();
+                if !seen || mtime != last {
+                    writes += 1;
+                    seen = true;
+                    last = mtime;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+        writes
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_timer_is_independent_of_sweep_period() {
+        // 10 秒间隔：在 50 秒内（第一次巡检都还没到）必须已经落过盘
+        assert!(
+            flush_count_within(10, 50, true).await >= 1,
+            "flush_interval=10 不应被 60 秒巡检拖到 60 秒后才落盘"
+        );
+        // 90 秒间隔：100 秒内应恰好落过一次（而不是被对齐到 120 秒）
+        assert!(
+            flush_count_within(90, 100, true).await >= 1,
+            "flush_interval=90 应在 90 秒落盘，而不是 120 秒"
+        );
+        // 300 秒（默认）：200 秒内不该落盘
+        assert_eq!(
+            flush_count_within(300, 200, true).await,
+            0,
+            "flush_interval=300 在 200 秒内不该落盘"
+        );
+        // 关闭持久化：无论多久都不落盘
+        assert_eq!(
+            flush_count_within(10, 200, false).await,
+            0,
+            "persist 关闭时落盘分支必须完全不执行"
+        );
     }
 }

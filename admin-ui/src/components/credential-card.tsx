@@ -664,7 +664,7 @@ function CredentialCardImpl({
         <Badge
           variant="warning"
           className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30 text-[11px]"
-          title="账号级风控冷却中"
+          title="账号级限流冷却中"
         >
           <Clock className="mr-1 h-3 w-3 inline" />
           冷却 {formatThrottleCountdown(throttleRemaining)}
@@ -757,7 +757,7 @@ function CredentialCardImpl({
             disabled={clearThrottle.isPending}
           >
             <Clock className="mr-2 h-4 w-4" />
-            解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+            解除限流冷却（{formatThrottleCountdown(throttleRemaining)}）
           </DropdownMenuItem>
         )}
         {balance?.overageCapable === true &&

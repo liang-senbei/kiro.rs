@@ -108,6 +108,11 @@ impl Default for EventStreamDecoder {
 }
 
 impl EventStreamDecoder {
+    /// EOF with pending bytes means an event frame was truncated.
+    pub fn has_pending_data(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
     /// 创建新的解码器
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_BUFFER_CAPACITY)

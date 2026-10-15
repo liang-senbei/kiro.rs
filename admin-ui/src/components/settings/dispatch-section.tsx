@@ -1,8 +1,12 @@
 import {
   useAccountThrottleConfig,
   useSetAccountThrottleConfig,
+  useModelApiRetryConfig,
+  useSetModelApiRetryConfig,
   useAccountRpmLimitConfig,
   useSetAccountRpmLimitConfig,
+  useQuotaResetRecoveryConfig,
+  useSetQuotaResetRecoveryConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useSelfHealConfig,
@@ -34,8 +38,9 @@ export function DispatchSection() {
   return (
     <div className="space-y-6">
       <LoadBalancingGroup />
-      <ThrottleGroup />
+      <RateLimitHandlingGroup />
       <RpmLimitGroup />
+      <QuotaResetRecoveryGroup />
       <SelfHealGroup />
     </div>
   )
@@ -69,45 +74,64 @@ function LoadBalancingGroup() {
   )
 }
 
-function ThrottleGroup() {
-  const { data, isLoading } = useAccountThrottleConfig()
-  const { mutate } = useSetAccountThrottleConfig()
-  const saver = useFieldSaver(mutate, reportSaveError)
-  const failover = data?.failover ?? true
-  const cooldownSecs = data?.cooldownSecs ?? 30 * SECS_PER_MIN
+function RateLimitHandlingGroup() {
+  const { data: throttle, isLoading: throttleLoading } = useAccountThrottleConfig()
+  const { mutate: setThrottle } = useSetAccountThrottleConfig()
+  const throttleSaver = useFieldSaver(setThrottle, reportSaveError)
+  const { data: retry, isLoading: retryLoading } = useModelApiRetryConfig()
+  const { mutate: setRetry } = useSetModelApiRetryConfig()
+  const retrySaver = useFieldSaver(setRetry, reportSaveError)
+  const failover = throttle?.failover ?? true
+  const cooldownSecs = throttle?.cooldownSecs ?? 30 * SECS_PER_MIN
+  const retryEnabled = retry?.enabled ?? true
 
   return (
     <SettingGroup
-      title="账号级风控"
-      description="上游对单个账号触发临时限速（429 + suspicious activity）时怎么处理"
+      title="上游 429 处理"
+      description="账号级限流按需切换凭据；容量类限流可由中转退避重试"
     >
       <SettingSwitch
         label="故障转移"
         hint={
           failover
-            ? '冷却该凭据并立即切到下一个可用凭据'
-            : '仅按瞬态错误重试，不切换凭据'
+            ? '账号触发请求或 credits 限流时，冷却当前凭据并换号重试'
+            : '账号级 429 直接返回客户端，不切换凭据'
         }
         checked={failover}
-        onChange={(next) => saver.save('failover', { failover: next })}
-        pending={saver.isSaving('failover')}
-        saved={saver.isSaved('failover')}
-        disabled={isLoading}
+        onChange={(next) => throttleSaver.save('failover', { failover: next })}
+        pending={throttleSaver.isSaving('failover')}
+        saved={throttleSaver.isSaved('failover')}
+        disabled={throttleLoading}
       />
       <SettingNumber
-        label="冷却时长"
-        hint="被风控的凭据要静默多久才重新参与调度"
+        label="账号冷却时长"
+        hint="被账号级限流的凭据要静默多久才重新参与调度"
         value={cooldownSecs}
         toDisplay={(secs) => Math.round(secs / SECS_PER_MIN)}
         fromDisplay={(min) => min * SECS_PER_MIN}
-        onCommit={(secs) => saver.save('cooldown', { cooldownSecs: secs })}
+        onCommit={(secs) =>
+          throttleSaver.save('cooldown', { cooldownSecs: secs })
+        }
         min={1}
         max={1440}
         unit="分钟"
         presets={[5, 15, 30, 60]}
-        pending={saver.isSaving('cooldown')}
-        saved={saver.isSaved('cooldown')}
-        disabled={isLoading || !failover}
+        pending={throttleSaver.isSaving('cooldown')}
+        saved={throttleSaver.isSaved('cooldown')}
+        disabled={throttleLoading || !failover}
+      />
+      <SettingSwitch
+        label="普通 429 自动重试"
+        hint={
+          retryEnabled
+            ? 'capacity / high traffic 等无需换号的 429 由中转退避重试'
+            : '无需换号的 429 首次失败就返回客户端，由客户端决定是否重试'
+        }
+        checked={retryEnabled}
+        onChange={(next) => retrySaver.save('enabled', { enabled: next })}
+        pending={retrySaver.isSaving('enabled')}
+        saved={retrySaver.isSaved('enabled')}
+        disabled={retryLoading}
       />
     </SettingGroup>
   )
@@ -116,9 +140,8 @@ function ThrottleGroup() {
 /**
  * 单账号 RPM 主动限流。
  *
- * 紧跟「账号级风控」是有意的：两者都是账号级限速，区别只在谁先动手 ——
- * 风控是上游 429 之后的被动补救，这里是我们自己先掐住不让它撞上去。
- * 摆在一起，配了主动限流还在等风控兜底这种误解就不容易发生。
+ * 紧跟「上游 429 处理」是有意的：两者都是账号级限速，区别只在谁先动手 ——
+ * 故障转移是收到上游 429 后的补救，这里是本地提前限制请求频率。
  */
 function RpmLimitGroup() {
   const { data, isLoading } = useAccountRpmLimitConfig()
@@ -157,6 +180,34 @@ function RpmLimitGroup() {
         pending={saver.isSaving('limit')}
         saved={saver.isSaved('limit')}
         disabled={isLoading || !enabled}
+      />
+    </SettingGroup>
+  )
+}
+
+function QuotaResetRecoveryGroup() {
+  const { data, isLoading } = useQuotaResetRecoveryConfig()
+  const { mutate } = useSetQuotaResetRecoveryConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.enabled ?? false
+
+  return (
+    <SettingGroup
+      title="月度额度恢复"
+      description="因额度耗尽被禁用的凭据，是否在下个账期自动恢复调度"
+    >
+      <SettingSwitch
+        label="自动恢复额度耗尽凭据"
+        hint={
+          enabled
+            ? '到凭据额度重置时间后复查余额，确认恢复额度后重新加入调度'
+            : '保持禁用，需在凭据管理中手动启用'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading}
       />
     </SettingGroup>
   )

@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -141,6 +141,12 @@ pub(crate) struct RequestTracer {
     /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
     /// 「是否沿用了上一轮账号」只看第一次。
     route: parking_lot::Mutex<Option<TraceRoute>>,
+    /// 是否已落库。[`finalize`](Self::finalize) 首次进入即置位，保证同一条 trace
+    /// 只写一行；[`Drop`] 兜底时据此判断「本请求从未正常收尾」。
+    finalized: std::sync::atomic::AtomicBool,
+    /// provider 成功返回 `reqwest::Response`，即已收到上游 HTTP 响应头。
+    /// 不能用「尚未 finalize」代替这个状态：下游可能在读取 body 前取消。
+    upstream_headers_received: std::sync::atomic::AtomicBool,
 }
 
 /// usage 三项的来源，落到 trace 行便于区分「上游真值」与「本地估算」。
@@ -218,10 +224,19 @@ impl RequestTracer {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
+    /// 标记 provider 已成功返回响应头。应在取得 `reqwest::Response` 后立刻调用，
+    /// 在创建/轮询下游 response body 之前完成。
+    pub(super) fn mark_upstream_headers_received(&self) {
+        self.upstream_headers_received
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 标记首个可发送的内容到达（幂等，仅记录第一次）。
     pub fn mark_first_token(&self) {
         if !self.is_stream {
             return;
@@ -229,6 +244,24 @@ impl RequestTracer {
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
+        }
+    }
+
+    fn mark_first_content(&self, events: &[SseEvent]) {
+        if events.iter().any(|event| match event.event.as_str() {
+            "content_block_start" => {
+                event.data.pointer("/content_block/type")
+                    .and_then(serde_json::Value::as_str) == Some("tool_use")
+            }
+            "content_block_delta" => ["text", "thinking", "partial_json"].iter().any(|field| {
+                event.data.get("delta")
+                    .and_then(|delta| delta.get(*field))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            }),
+            _ => false,
+        }) {
+            self.mark_first_token();
         }
     }
 
@@ -241,6 +274,13 @@ impl RequestTracer {
         interrupted_after_bytes: Option<u64>,
         usage: TraceUsage,
     ) {
+        // 幂等：首次进入置位，防止显式收尾后 Drop 兜底再写一次（insert 按 trace_id 覆盖）。
+        if self
+            .finalized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
@@ -278,6 +318,43 @@ impl RequestTracer {
             attempts,
         };
         store.insert(&rec);
+    }
+}
+
+/// 兜底落库：请求被取消、走不到任何显式 finalize 时补一行。
+///
+/// `upstream_headers_received=false` 才表示请求仍在等待上游响应头；若 headers 已到
+/// 但 body 尚未被读取/收尾，则应归为流中断，不能误报为等头超时。
+///
+/// 只记录可观测到的事实（头未到达即被取消），不推断原因：此处无法区分前置 SLB 等头超时、
+/// 客户端读超时、用户主动中断、客户端进程退出等——它们在这一层长得完全一样。原因需结合
+/// `duration_ms`（如贴近 SLB 的等头超时值）与下游日志判断。
+///
+/// 已正常收尾的请求已置位 `finalized`，幂等守卫使此处成为空操作，不会双写或覆盖。
+impl Drop for RequestTracer {
+    fn drop(&mut self) {
+        let headers_received = self
+            .upstream_headers_received
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (error_type, message) = if headers_received {
+            (
+                outcome::STREAM_INTERRUPTED,
+                "request was cancelled after upstream response headers arrived",
+            )
+        } else {
+            (
+                outcome::ABANDONED_BEFORE_HEADERS,
+                "request was cancelled while awaiting upstream response headers",
+            )
+        };
+        // final_status 复用 "interrupted"（前端归入「中断」徽章），靠 error_type 区分具体类型。
+        self.finalize(
+            "interrupted",
+            Some(error_type),
+            Some(message),
+            None,
+            TraceUsage::zero(),
+        );
     }
 }
 
@@ -372,6 +449,35 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if err
+        .downcast_ref::<crate::kiro::error::UpstreamTimeoutError>()
+        .is_some()
+    {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(ErrorResponse::new(
+                "api_error",
+                "Upstream timed out before returning a response.",
+            )),
+        )
+            .into_response();
+    }
+    if let Some(unavailable) =
+        err.downcast_ref::<crate::kiro::error::UpstreamModelUnavailableError>()
+    {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "overloaded_error",
+                "Upstream model is temporarily overloaded. Retry later.",
+            )),
+        )
+            .into_response();
+        if let Ok(value) = unavailable.retry_after.parse() {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
     if err
         .downcast_ref::<crate::kiro::error::UpstreamContextOverflowError>()
         .is_some()
@@ -511,7 +617,12 @@ fn resolve_non_stream_usage(
         );
     }
 
-    let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
+    // contextUsage 覆盖生成结束后的整个上下文（含本轮输出），分摊前先扣掉输出。
+    let total_input = token::input_tokens_excluding_output(
+        context_total_input_tokens,
+        fallback_total_input_tokens,
+        fallback_output_tokens,
+    );
     let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
     (
         input,
@@ -813,6 +924,8 @@ pub async fn post_messages(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            state.cache_meter.clone(),
+            key_ctx.key_id,
         )
         .await;
     }
@@ -989,13 +1102,14 @@ async fn handle_stream_request(
             tracer.finalize(
                 "error",
                 last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
+                Some(&format!("{e:#}")),
                 None,
                 TraceUsage::zero(),
             );
             return map_provider_error(e);
         }
     };
+    tracer.mark_upstream_headers_received();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -1097,6 +1211,8 @@ struct TruncationRetry {
     start: Box<dyn FnMut() -> RetryCallFuture + Send>,
     /// 进行中的重试请求（等待期间照常发 ping）
     in_flight: Option<RetryCallFuture>,
+    /// 当前这次上游响应开始时已收到的字节数，用来判断本次响应是不是空流
+    body_start_bytes: u64,
 }
 
 impl TruncationRetry {
@@ -1113,6 +1229,7 @@ impl TruncationRetry {
             last_reason: "上游中途收尾",
             start: Box::new(move || Box::pin(start()) as RetryCallFuture),
             in_flight: None,
+            body_start_bytes: 0,
         }
     }
 }
@@ -1199,9 +1316,14 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
-/// 解析一个上游帧。没有转成 [`Event`] 的帧（未知事件类型 / 解析失败）返回其类型，
-/// 由调用方记进诊断信息——以前这类帧被静默丢弃，出问题时日志里什么都看不到。
-fn decode_kiro_frame(frame: crate::kiro::parser::frame::Frame) -> Result<Event, String> {
+/// 解析一个上游帧。
+///
+/// 未知事件类型返回 `Ok(None)`，并把帧类型记进诊断信息（以前这类帧被静默丢弃，出问题时
+/// 日志里什么都看不到）。帧本身无法解析说明响应流已损坏，返回错误。
+fn decode_kiro_frame(
+    frame: crate::kiro::parser::frame::Frame,
+    ctx: &mut StreamContext,
+) -> Result<Option<Event>, String> {
     let kind = format!(
         "{}:{}",
         frame.message_type().unwrap_or("event"),
@@ -1210,19 +1332,68 @@ fn decode_kiro_frame(frame: crate::kiro::parser::frame::Frame) -> Result<Event, 
     match Event::from_frame(frame) {
         Ok(Event::Unknown {}) => {
             tracing::debug!(kind = %kind, "忽略未知的上游事件");
-            Err(kind)
+            ctx.note_dropped_frame(&kind);
+            Ok(None)
         }
-        Ok(event) => Ok(event),
-        Err(e) => {
-            tracing::warn!(kind = %kind, "解析上游事件失败: {}", e);
-            Err(kind)
-        }
+        Ok(event) => Ok(Some(event)),
+        Err(e) => Err(format!("{kind}: {e}")),
     }
 }
 
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+/// 上游响应流读失败或已损坏（读 body 出错、空流、半截帧、无法解析的帧、上游 error /
+/// exception 事件）时的收尾。
+///
+/// 客户端只收到过 thinking、且还有重试次数时，在同一条流里透明重试；缓冲里没发出去的内容
+/// 可能是半截的，不 flush，由 `prepare_truncation_retry` 丢弃。否则关闭已打开的内容块并以
+/// error 终态结束：流已开始后无法修改 HTTP 状态码，不能用正常 message_stop 掩盖上游断流。
+///
+/// `events` 是本批已生成、还没发出的事件，状态机认为它们已发出，必须原样带上。
+/// 返回要发给客户端的字节，以及这条流是否就此结束。
+fn fail_stream_or_retry(
+    ctx: &mut StreamContext,
+    settlement: &mut StreamSettlement,
+    retry: &mut Option<TruncationRetry>,
+    mut events: Vec<SseEvent>,
+    cause: &str,
+    sent_bytes: u64,
+) -> (Vec<Result<Bytes, Infallible>>, bool) {
+    let retryable = ctx.is_retryable_read_error();
+    if retryable && let Some(r) = retry.as_mut().filter(|r| r.remaining > 0) {
+        r.remaining -= 1;
+        r.attempts += 1;
+        r.last_reason = "读取上游响应流失败";
+        tracing::warn!(
+            attempt = r.attempts,
+            credits = ctx.credits,
+            output_tokens = ctx.output_tokens,
+            "上游响应流中断或无效，透明重试: {}",
+            cause
+        );
+        events.extend(ctx.prepare_truncation_retry());
+        r.in_flight = Some((r.start)());
+        settlement.tracer.mark_first_content(&events);
+        settlement.update(ctx, sent_bytes);
+        return (sse_bytes(events), false);
+    }
+    let retried = retry.as_ref().map_or(0, |r| r.attempts);
+    settlement.tracer.mark_first_content(&events);
+    // 客户端只收到过 thinking：按上游中途收尾处理，发 overloaded_error 让客户端当成临时故障
+    // 自行重试；已有正文 / 工具调用则如实报断流。
+    let error_type = if retryable {
+        super::stream::TRUNCATION_ERROR_TYPE
+    } else {
+        "api_error"
+    };
+    let message = format!("{}（透明重试 {} 次）", cause, retried);
+    (
+        settlement.interrupt(ctx, events, error_type, &message, sent_bytes),
+        true,
+    )
 }
 
 /// 创建 SSE 事件流
@@ -1262,6 +1433,9 @@ fn create_sse_stream(
                                 body_stream = call_result.response.bytes_stream();
                                 decoder = EventStreamDecoder::new();
                                 settlement.credential_id = call_result.credential_id;
+                                if let Some(r) = retry.as_mut() {
+                                    r.body_start_bytes = sent_bytes;
+                                }
                                 return Some((stream::iter(Vec::new()), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
                             }
                             Err(e) => {
@@ -1295,90 +1469,67 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            settlement.tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                let (bytes, finished) = fail_stream_or_retry(&mut ctx, &mut settlement, &mut retry, Vec::new(), &e.to_string(), sent_bytes);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, finished, ping_interval, settlement, sent_bytes, retry)));
                             }
 
                             let mut events = Vec::new();
+                            let mut failure = None;
                             for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => match decode_kiro_frame(frame) {
-                                        Ok(event) => {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                let event = match result {
+                                    Ok(frame) => match decode_kiro_frame(frame, &mut ctx) {
+                                        Ok(Some(event)) => event,
+                                        Ok(None) => continue,
+                                        Err(error) => {
+                                            failure = Some(error);
+                                            break;
                                         }
-                                        Err(kind) => ctx.note_dropped_frame(&kind),
                                     },
                                     Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
+                                        failure = Some(e.to_string());
+                                        break;
                                     }
+                                };
+                                if let Some(error) = upstream_event_error(&event) {
+                                    failure = Some(error);
+                                    break;
                                 }
+                                let generated = ctx.process_kiro_event(&event);
+                                settlement.tracer.mark_first_content(&generated);
+                                events.extend(generated);
+                            }
+                            if let Some(cause) = failure {
+                                let (bytes, finished) = fail_stream_or_retry(&mut ctx, &mut settlement, &mut retry, events, &cause, sent_bytes);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, finished, ping_interval, settlement, sent_bytes, retry)));
                             }
 
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
                             settlement.update(&ctx, sent_bytes);
-
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)))
+                            Some((stream::iter(sse_bytes(events)), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)))
                         }
                         Some(Err(e)) => {
-                            let cause = error_chain(&e);
-                            // 读上游响应体出错（连接被重置、HTTP/2 流被取消、读空闲超时）：客户端
-                            // 只收到过 thinking 时还有重试次数就透明重试；缓冲里没发出去的内容可能是
-                            // 半截的，不 flush，由 prepare_truncation_retry 丢弃
-                            let read_error_retryable = ctx.is_retryable_read_error();
-                            if read_error_retryable
-                                && let Some(r) = retry.as_mut().filter(|r| r.remaining > 0)
-                            {
-                                r.remaining -= 1;
-                                r.attempts += 1;
-                                r.last_reason = "读取上游响应流失败";
-                                tracing::warn!(
-                                    attempt = r.attempts,
-                                    credits = ctx.credits,
-                                    output_tokens = ctx.output_tokens,
-                                    "读取上游响应流失败，透明重试: {}",
-                                    cause
-                                );
-                                let events = ctx.prepare_truncation_retry();
-                                r.in_flight = Some((r.start)());
-                                settlement.update(&ctx, sent_bytes);
-                                return Some((stream::iter(sse_bytes(events)), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
-                            }
-                            let retried = retry.as_ref().map_or(0, |r| r.attempts);
-                            tracing::error!(retried, "读取上游响应流失败: {}", cause);
-                            // 流已开始后无法修改 HTTP 状态码。关闭已打开的内容块并发送
-                            // Anthropic error 终态，不能用正常 message_stop 掩盖上游断流。
-                            // 客户端只收到过 thinking：按上游中途收尾处理，发 overloaded_error 让
-                            // 客户端当成临时故障自行重试；已有正文 / 工具调用则如实报断流。
-                            let error_type = if read_error_retryable {
-                                super::stream::TRUNCATION_ERROR_TYPE
-                            } else {
-                                "upstream_error"
-                            };
-                            let final_events = ctx.generate_error_events(
-                                error_type,
-                                "Upstream response stream was interrupted",
-                            );
-                            settlement.update(&ctx, sent_bytes);
-                            // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
-                            let message = format!("读取上游响应流失败: {}（透明重试 {} 次）", cause, retried);
-                            settlement.finish(
-                                "error",
-                                "interrupted",
-                                Some(outcome::STREAM_INTERRUPTED),
-                                Some(&message),
-                                Some(sent_bytes),
-                            );
-                            Some((stream::iter(sse_bytes(final_events)), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
+                            // 连接被重置、HTTP/2 流被取消、读空闲超时等
+                            let cause = format!("读取上游响应流失败: {}", error_chain(&e));
+                            let (bytes, finished) = fail_stream_or_retry(&mut ctx, &mut settlement, &mut retry, Vec::new(), &cause, sent_bytes);
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, finished, ping_interval, settlement, sent_bytes, retry)))
                         }
                         None => {
+                            // 本次上游响应一个字节都没有，或停在半截帧上：响应流无效，不是正常收尾
+                            let body_start = retry.as_ref().map_or(0, |r| r.body_start_bytes);
+                            let invalid = if sent_bytes == body_start {
+                                Some("Upstream returned an empty event stream")
+                            } else if decoder.has_pending_data() {
+                                Some("Upstream ended with an incomplete event frame")
+                            } else {
+                                None
+                            };
+                            if let Some(cause) = invalid {
+                                let (bytes, finished) = fail_stream_or_retry(&mut ctx, &mut settlement, &mut retry, Vec::new(), cause, sent_bytes);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, finished, ping_interval, settlement, sent_bytes, retry)));
+                            }
+
                             // 上游中途收尾：还有重试次数就在同一条流里透明重试
                             let mut events = ctx.flush_pending_buffers();
                             if ctx.is_retryable_truncation()
@@ -1397,6 +1548,7 @@ fn create_sse_stream(
                                 );
                                 events.extend(ctx.prepare_truncation_retry());
                                 r.in_flight = Some((r.start)());
+                                settlement.tracer.mark_first_content(&events);
                                 settlement.update(&ctx, sent_bytes);
                                 return Some((stream::iter(sse_bytes(events)), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, retry)));
                             }
@@ -1406,6 +1558,7 @@ fn create_sse_stream(
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             events.extend(ctx.generate_final_events());
                             let final_events = events;
+                            settlement.tracer.mark_first_content(&final_events);
                             settlement.update(&ctx, sent_bytes);
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
@@ -1433,11 +1586,7 @@ fn create_sse_stream(
                                 }
                                 settlement.finish("success", "success", None, None, None);
                             }
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
+                            Some((stream::iter(sse_bytes(final_events)), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, retry)))
                         }
                     }
                 }
@@ -1471,6 +1620,29 @@ struct StreamSettlement {
 }
 
 impl StreamSettlement {
+    fn interrupt(
+        &mut self,
+        ctx: &mut StreamContext,
+        mut events: Vec<SseEvent>,
+        error_type: &str,
+        error: &str,
+        bytes: u64,
+    ) -> Vec<Result<Bytes, Infallible>> {
+        tracing::error!(error, "Upstream response stream was interrupted");
+        events.extend(
+            ctx.generate_error_events(error_type, "Upstream response stream was interrupted"),
+        );
+        self.update(ctx, bytes);
+        self.finish(
+            "error",
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some(error),
+            Some(bytes),
+        );
+        sse_bytes(events)
+    }
+
     fn new(
         hook: UsageRecordHook,
         credential_id: u64,
@@ -1619,6 +1791,22 @@ async fn handle_non_stream_request(
     }
 }
 
+fn upstream_event_error(event: &Event) -> Option<String> {
+    match event {
+        Event::Error {
+            error_code,
+            error_message,
+        } => Some(format!("{error_code}: {error_message}")),
+        Event::Exception {
+            exception_type,
+            message,
+        } if exception_type != "ContentLengthExceededException" => {
+            Some(format!("{exception_type}: {message}"))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn execute_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1678,18 +1866,23 @@ struct NonStreamAttempt {
     truncation_reason: Option<&'static str>,
 }
 
+/// 非流式响应分片喂给解码器的大小
+const NON_STREAM_DECODE_CHUNK: usize = 1024 * 1024;
+
 /// 解析一次上游非流式响应（AWS event-stream 字节）
+///
+/// 响应流无效（空流、半截帧、无法解析的帧、上游 error / exception 事件）时返回原因，
+/// 不能把残缺内容当成功结果交出去。
 fn parse_non_stream_attempt(
     body_bytes: &[u8],
     model: &str,
     thinking_enabled: bool,
     tool_name_map: &std::collections::HashMap<String, String>,
-) -> NonStreamAttempt {
-    // 解析事件流
-    let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
+) -> Result<NonStreamAttempt, String> {
+    if body_bytes.is_empty() {
+        return Err("Upstream returned an empty event stream".to_string());
     }
+    let mut decoder = EventStreamDecoder::new();
 
     let mut text_content = String::new();
     let mut native_thinking = String::new();
@@ -1717,107 +1910,110 @@ fn parse_non_stream_attempt(
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
 
-    for result in decoder.decode_iter() {
-        match result {
-            Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
-                        Event::AssistantResponse(resp) => {
-                            // 工具调用之后还有实质内容：上游没在工具调用处收尾（纯空白不算）
-                            if !resp.content.trim().is_empty() {
-                                tools_unconfirmed = false;
-                            }
-                            text_content.push_str(&resp.content);
-                        }
-                        Event::ReasoningContent(reasoning) => {
-                            tools_unconfirmed = false;
-                            if let Some(text) = reasoning.text
-                                && !text.is_empty()
-                            {
-                                native_thinking.push_str(&text);
-                            }
-                            if let Some(signature) = reasoning.signature
-                                && !signature.is_empty()
-                            {
-                                native_thinking_signature = Some(signature);
-                            }
-                            if let Some(redacted) = reasoning.redacted_content
-                                && !redacted.is_empty()
-                            {
-                                native_redacted_thinking.push(redacted);
-                            }
-                        }
-                        Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
-                            match tool_accumulator.push(&tool_use, tool_name_map) {
-                                Ok(Some(completed)) => {
-                                    tool_uses.push(completed.to_anthropic_block());
-                                    tools_unconfirmed = metering.is_none();
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    tracing::error!("{}", e);
-                                    tool_json_error = Some(e);
-                                }
-                            }
-                        }
-                        Event::Metadata(metadata) => {
-                            if let Some(usage) = metadata.token_usage {
-                                let usage = usage.sanitized();
-                                tracing::debug!(
-                                    uncached_input_tokens = usage.uncached_input_tokens,
-                                    cache_write_input_tokens = usage.cache_write_input_tokens,
-                                    cache_read_input_tokens = usage.cache_read_input_tokens,
-                                    output_tokens = usage.output_tokens,
-                                    "收到 metadataEvent.tokenUsage 精确用量"
-                                );
-                                // 单条 provider 流内是最终快照，重复事件取最后一份。
-                                provider_token_usage = Some(usage);
-                            }
-                        }
-                        Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
-                                    / 100.0) as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
-                                stop_reason = "model_context_window_exceeded".to_string();
-                            }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
-                            );
-                        }
-                        Event::Metering(event_metering) => {
-                            // 上游只下发 credit；token / cache 字段不存在
-                            credits += event_metering.usage;
-                            tracing::debug!(
-                                usage = event_metering.usage,
-                                unit = %event_metering.unit,
-                                unit_plural = %event_metering.unit_plural,
-                                "metering credits +{:.6}", event_metering.usage
-                            );
-                            metering = Some(event_metering);
-                            // 有 meteringEvent 说明上游正常结束了这次生成
-                            tools_unconfirmed = false;
-                        }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
-                            }
-                        }
-                        _ => {}
+    // 分片喂给解码器：整段响应可能超过解码器的缓冲上限（16 MB），一次性 feed 会溢出。
+    for piece in body_bytes.chunks(NON_STREAM_DECODE_CHUNK) {
+        decoder.feed(piece).map_err(|e| e.to_string())?;
+        for result in decoder.decode_iter() {
+            let frame = result.map_err(|e| e.to_string())?;
+            let event = Event::from_frame(frame).map_err(|e| e.to_string())?;
+            if let Some(error) = upstream_event_error(&event) {
+                return Err(error);
+            }
+            match event {
+                Event::AssistantResponse(resp) => {
+                    // 工具调用之后还有实质内容：上游没在工具调用处收尾（纯空白不算）
+                    if !resp.content.trim().is_empty() {
+                        tools_unconfirmed = false;
+                    }
+                    text_content.push_str(&resp.content);
+                }
+                Event::ReasoningContent(reasoning) => {
+                    tools_unconfirmed = false;
+                    if let Some(text) = reasoning.text
+                        && !text.is_empty()
+                    {
+                        native_thinking.push_str(&text);
+                    }
+                    if let Some(signature) = reasoning.signature
+                        && !signature.is_empty()
+                    {
+                        native_thinking_signature = Some(signature);
+                    }
+                    if let Some(redacted) = reasoning.redacted_content
+                        && !redacted.is_empty()
+                    {
+                        native_redacted_thinking.push(redacted);
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("解码事件失败: {}", e);
+                Event::ToolUse(tool_use) => {
+                    has_tool_use = true;
+                    match tool_accumulator.push(&tool_use, tool_name_map) {
+                        Ok(Some(completed)) => {
+                            tool_uses.push(completed.to_anthropic_block());
+                            tools_unconfirmed = metering.is_none();
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!("{}", e);
+                            tool_json_error = Some(e);
+                        }
+                    }
+                }
+                Event::Metadata(metadata) => {
+                    if let Some(usage) = metadata.token_usage {
+                        let usage = usage.sanitized();
+                        tracing::debug!(
+                            uncached_input_tokens = usage.uncached_input_tokens,
+                            cache_write_input_tokens = usage.cache_write_input_tokens,
+                            cache_read_input_tokens = usage.cache_read_input_tokens,
+                            output_tokens = usage.output_tokens,
+                            "收到 metadataEvent.tokenUsage 精确用量"
+                        );
+                        // 单条 provider 流内是最终快照，重复事件取最后一份。
+                        provider_token_usage = Some(usage);
+                    }
+                }
+                Event::ContextUsage(context_usage) => {
+                    // 从上下文使用百分比计算实际的 input_tokens
+                    let window_size = get_context_window_size(model);
+                    let actual_input_tokens =
+                        (context_usage.context_usage_percentage * (window_size as f64)
+                            / 100.0) as i32;
+                    context_input_tokens = Some(actual_input_tokens);
+                    // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                    if context_usage.context_usage_percentage >= 100.0 {
+                        stop_reason = "model_context_window_exceeded".to_string();
+                    }
+                    tracing::debug!(
+                        "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                        context_usage.context_usage_percentage,
+                        actual_input_tokens
+                    );
+                }
+                Event::Metering(event_metering) => {
+                    // 上游只下发 credit；token / cache 字段不存在
+                    credits += event_metering.usage;
+                    tracing::debug!(
+                        usage = event_metering.usage,
+                        unit = %event_metering.unit,
+                        unit_plural = %event_metering.unit_plural,
+                        "metering credits +{:.6}", event_metering.usage
+                    );
+                    metering = Some(event_metering);
+                    // 有 meteringEvent 说明上游正常结束了这次生成
+                    tools_unconfirmed = false;
+                }
+                Event::Exception { exception_type, .. } => {
+                    if exception_type == "ContentLengthExceededException" {
+                        stop_reason = "max_tokens".to_string();
+                    }
+                }
+                _ => {}
             }
         }
+    }
+    if decoder.has_pending_data() {
+        return Err("Upstream ended with an incomplete event frame".to_string());
     }
 
     // 收尾：无参工具（0 字节滞留、上游不会补 stop=true）按 {} 还原补进 content，
@@ -1865,7 +2061,7 @@ fn parse_non_stream_attempt(
         None
     };
 
-    NonStreamAttempt {
+    Ok(NonStreamAttempt {
         content,
         stop_reason,
         context_input_tokens,
@@ -1874,7 +2070,7 @@ fn parse_non_stream_attempt(
         metering,
         tool_json_error,
         truncation_reason,
-    }
+    })
 }
 
 /// 内容里只有 thinking：没有非空白正文、也没有工具调用
@@ -1915,32 +2111,33 @@ where
                 tracer.finalize(
                     "error",
                     last_attempt_outcome(tracer),
-                    Some(&e.to_string()),
+                    Some(&format!("{e:#}")),
                     None,
                     TraceUsage::zero(),
                 );
                 return Err(NonStreamExecutionError::Provider(e));
             }
         };
+        tracer.mark_upstream_headers_received();
         let credential_id = call_result.credential_id;
 
-        // 读取响应体
-        let body_bytes = match call_result.response.bytes().await {
-            Ok(bytes) => bytes,
-            // 连接被重置、HTTP/2 流被取消、读空闲超时等：非流式还没给客户端写过任何字节，可以重试
-            Err(e) if retries < TRUNCATION_MAX_RETRIES => {
+        // 读取并解析响应体。读失败（连接被重置、HTTP/2 流被取消、读空闲超时）或响应流无效
+        // （空流、半截帧、无法解析的帧、上游 error / exception 事件）：非流式还没给客户端
+        // 写过任何字节，可以透明重试。
+        let attempt = match call_result.response.bytes().await {
+            Ok(bytes) => parse_non_stream_attempt(&bytes, model, thinking_enabled, tool_name_map),
+            Err(e) => Err(format!("读取上游响应体失败: {}", error_chain(&e))),
+        };
+        let parsed = match attempt {
+            Ok(parsed) => parsed,
+            Err(cause) if retries < TRUNCATION_MAX_RETRIES => {
                 retries += 1;
-                tracing::warn!(
-                    attempt = retries,
-                    "读取上游响应体失败，透明重试: {}",
-                    error_chain(&e)
-                );
+                tracing::warn!(attempt = retries, "上游响应流中断或无效，透明重试: {}", cause);
                 continue;
             }
-            Err(e) => {
-                let cause = error_chain(&e);
-                tracing::error!(retried = retries, "读取上游响应体失败: {}", cause);
-                let message = format!("读取上游响应体失败: {}（透明重试 {} 次）", cause, retries);
+            Err(cause) => {
+                tracing::error!(retried = retries, "上游响应流中断或无效: {}", cause);
+                let message = format!("{}（透明重试 {} 次）", cause, retries);
                 hook.record(
                     credential_id,
                     input_tokens,
@@ -1962,15 +2159,13 @@ where
                         StatusCode::BAD_GATEWAY,
                         Json(ErrorResponse::new(
                             "api_error",
-                            format!("读取响应失败: {}", e),
+                            "Invalid or interrupted upstream response stream",
                         )),
                     )
                         .into_response(),
                 ));
             }
         };
-
-        let parsed = parse_non_stream_attempt(&body_bytes, model, thinking_enabled, tool_name_map);
         if let Some(reason) = parsed.truncation_reason
             && retries < TRUNCATION_MAX_RETRIES
         {
@@ -2368,6 +2563,8 @@ pub async fn post_messages_cc(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            state.cache_meter.clone(),
+            key_ctx.key_id,
         )
         .await;
     }
@@ -2456,7 +2653,7 @@ pub async fn post_messages_cc(
     };
 
     if payload.stream {
-        // 流式响应（缓冲模式）
+        // Stream content immediately; final usage arrives in message_delta.
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
@@ -2465,10 +2662,12 @@ pub async fn post_messages_cc(
                 is_stream: true,
             },
         ));
-        handle_stream_request_buffered(
+        let model = payload.model.clone();
+        let effort_downgrade = RetryEffortDowngrade::new(payload, state.tool_compatibility_mode);
+        handle_cc_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &model,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
@@ -2477,6 +2676,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            effort_downgrade,
         )
         .await
     } else {
@@ -2510,11 +2710,9 @@ pub async fn post_messages_cc(
     }
 }
 
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
+/// Claude Code uses the live stream too. Initial usage is an estimate;
+/// message_delta carries the final provider usage without delaying content.
+async fn handle_cc_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
@@ -2526,206 +2724,23 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    effort_downgrade: Option<RetryEffortDowngrade>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
-            return map_provider_error(e);
-        }
-    };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
-    // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(
+    handle_stream_request(
+        provider,
+        request_body,
         model,
         fallback_input_tokens,
         thinking_enabled,
         tool_name_map,
         known_tool_names,
-    );
-    ctx.set_cache_usage(cache_usage);
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header("x-accel-buffering", "no")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-/// 创建缓冲 SSE 事件流
-///
-/// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
-fn create_buffered_sse_stream(
-    response: reqwest::Response,
-    ctx: BufferedStreamContext,
-    hook: UsageRecordHook,
-    credential_id: u64,
-    tracer: std::sync::Arc<RequestTracer>,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
-
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            hook,
-            credential_id,
-            tracer,
-            0u64,
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
-            if finished {
-                return None;
-            }
-
-            loop {
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
-                    }
-
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                tracer.mark_first_token();
-                                sent_bytes += chunk.len() as u64;
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
-
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => match decode_kiro_frame(frame) {
-                                            // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                            Ok(event) => ctx.process_and_buffer(&event),
-                                            Err(kind) => ctx.note_dropped_frame(&kind),
-                                        },
-                                        Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
-                                        }
-                                    }
-                                }
-                                // 继续读取下一个 chunk，不发送任何数据
-                            }
-                            Some(Err(e)) => {
-                                let cause = error_chain(&e);
-                                tracing::error!("读取上游响应流失败: {}", cause);
-                                // 客户端只收到过 ping：丢弃可能半截的缓冲，只发 error 终态，
-                                // 不能以 message_stop 把截断的回答当成完整回答交出去。
-                                // overloaded_error 让客户端当成临时故障整轮重试。
-                                let all_events = ctx.abort_with_error(
-                                    super::stream::TRUNCATION_ERROR_TYPE,
-                                    "Upstream response stream was interrupted",
-                                );
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                // 缓冲模式 chunk 读取失败：上游中途断流
-                                tracer.finalize(
-                                    "interrupted",
-                                    Some(outcome::STREAM_INTERRUPTED),
-                                    Some(&cause),
-                                    Some(sent_bytes),
-                                    TraceUsage {
-                                        input_tokens: i.max(0) as u64,
-                                        output_tokens: o.max(0) as u64,
-                                        cache_creation_tokens: cc.max(0) as u64,
-                                        cache_read_tokens: cr.max(0) as u64,
-                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                        source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
-                                    },
-                                );
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
-                            }
-                            None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
-                                // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
-                                // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
-                                let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                let trace_usage = TraceUsage {
-                                    input_tokens: i.max(0) as u64,
-                                    output_tokens: o.max(0) as u64,
-                                    cache_creation_tokens: cc.max(0) as u64,
-                                    cache_read_tokens: cr.max(0) as u64,
-                                    credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                    source: UsageSource::resolve(ctx.has_provider_usage(), ctx.cache_usage()),
-                                };
-                                if let Some(message) = ctx.tool_json_error_message() {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                    tracer.finalize(
-                                        "error",
-                                        Some(outcome::BAD_REQUEST),
-                                        Some(&message),
-                                        None,
-                                        trace_usage,
-                                    );
-                                } else if let Some(reason) = ctx.truncation_error() {
-                                    // 只有 thinking、没有正文：上游中途收尾，error 事件已随缓冲发出
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                    tracer.finalize(
-                                        "interrupted",
-                                        Some(outcome::STREAM_INTERRUPTED),
-                                        Some(reason),
-                                        Some(sent_bytes),
-                                        trace_usage,
-                                    );
-                                } else {
-                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                    tracer.finalize("success", None, None, None, trace_usage);
-                                }
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
-                            }
-                        }
-                    }
-                }
-            }
-        },
+        hook,
+        cache_usage,
+        tracer,
+        group,
+        effort_downgrade,
     )
-    .flatten()
+    .await
 }
 
 #[cfg(test)]
@@ -2777,6 +2792,63 @@ mod tests {
         assert_eq!(overview.today_credits, 0.5);
     }
 
+    /// CC 实时流在客户端断开时：Drop 必须记账 + 落 trace，
+    /// 且已产生的用量不能丢（与 /v1 的 StreamSettlement 行为一致）。
+    #[test]
+    fn dropped_cc_live_stream_settles_usage_and_trace() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw)
+            .with_usage(None, None, Some(aggregator.clone()))
+            .with_trace_store(Some(store.clone()));
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 0,
+                    group: None,
+                    key_source: TraceKeySource::MasterApiKey,
+                    client_ip: None,
+                },
+                model: "test-model".to_string(),
+                is_stream: true,
+            },
+        ));
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            11,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.cache_usage = super::super::cache_metering::CacheUsage::default();
+
+        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx);
+        settlement.update(&ctx, 456);
+        drop(settlement);
+
+        // 用量必须落账（不能因取消而丢失）
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+
+        // trace 必须留痕，且归类为流中断（而非 abandoned_before_headers）
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records[0].final_status, "interrupted");
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED)
+        );
+        assert_eq!(records[0].interrupted_after_bytes, Some(456));
+    }
+
     #[test]
     fn tracer_renumbers_attempts_across_provider_rounds_before_persisting() {
         use crate::admin::trace_db::{TraceQuery, TraceStore};
@@ -2795,6 +2867,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2866,6 +2940,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
 
         tracer.mark_first_token();
@@ -2898,6 +2974,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2930,6 +3008,125 @@ mod tests {
         assert_eq!(record.total_attempts, 2);
         assert_eq!(record.attempts[0].endpoint, "ide");
         assert_eq!(record.attempts[1].endpoint, "cli");
+    }
+
+    /// 从未显式 finalize → Drop 兜底补一条 abandoned 记录（attempts=0 / first_token=None）。
+    #[test]
+    fn tracer_drop_records_abandoned_when_never_finalized() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let _tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "abandoned-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: true,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            // 不调用任何 finalize，直接离开作用域触发 Drop
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应兜底落一行");
+        let record = &records[0];
+        assert_eq!(record.final_status, "interrupted");
+        assert_eq!(
+            record.error_type.as_deref(),
+            Some(outcome::ABANDONED_BEFORE_HEADERS)
+        );
+        assert_eq!(record.total_attempts, 0);
+        assert_eq!(record.first_token_ms, None);
+        assert_eq!(record.interrupted_after_bytes, None);
+    }
+
+    /// provider 已返回 response headers 后、body 收尾前请求被取消：不能误报为等头阶段
+    /// 中断。这个覆盖非流式 body 读取，以及未来忘记安装 stream settlement 的新路径。
+    #[test]
+    fn tracer_drop_records_stream_interrupted_after_headers_arrive() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "headers-arrived-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: true,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            tracer.mark_upstream_headers_received();
+            // 不调用 finalize，直接离开作用域模拟 headers 已到后 handler/body 被取消。
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "Drop 应兜底落一行");
+        assert_eq!(records[0].final_status, "interrupted");
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some(outcome::STREAM_INTERRUPTED)
+        );
+        assert_eq!(records[0].first_token_ms, None);
+    }
+
+    /// 已显式 finalize 的请求：Drop 走幂等守卫，不得再写第二行、也不得覆盖原记录。
+    #[test]
+    fn tracer_drop_is_noop_when_already_finalized() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "finalized-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "claude-sonnet-5".to_string(),
+                is_stream: false,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                client_ip: None,
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            tracer.finalize("success", None, None, None, TraceUsage::zero());
+            // 离开作用域触发 Drop —— 应被幂等守卫拦下
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "已 finalize 后 Drop 不得再写一行");
+        assert_eq!(records[0].final_status, "success");
+        assert_eq!(records[0].error_type, None);
     }
 
     #[test]
@@ -3290,10 +3487,27 @@ mod tests {
             prompt_total_est: 100,
         };
 
+        // context 80 - output 9 = 71，再按 50/100 分摊：35 / 18 / 18。
+        // output_tokens 字段本身不受扣减影响，仍是 9。
         assert_eq!(
             resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
-            (40, 9, 20, 20)
+            (35, 9, 18, 18)
         );
+        let (input, _, creation, read) =
+            resolve_non_stream_usage(100, Some(80), 9, cache_usage, None);
+        assert_eq!(
+            input + creation + read,
+            71,
+            "分摊必须发生在扣减之后，三份之和等于修正后的 total"
+        );
+        // output 必须取正数：若传 -9，错实现（对 fallback 分支也扣减）因
+        // output.max(0) == 0 而照样得到 100，这条断言就失去鉴别力。
+        // 取 9 后，错实现会得到 91，与期望的 100 不符，立刻暴露。
+        assert_eq!(
+            resolve_non_stream_usage(100, None, 9, Default::default(), None),
+            (100, 9, 0, 0)
+        );
+        // 负输出的 clamp 另行单独覆盖（口径与上一条互不干扰）。
         assert_eq!(
             resolve_non_stream_usage(100, None, -9, Default::default(), None),
             (100, 0, 0, 0)
@@ -3968,7 +4182,7 @@ mod tests {
         );
         let (last_event, last_data) = events.last().unwrap();
         assert_eq!(last_event, "error");
-        assert_eq!(last_data["error"]["type"], "upstream_error");
+        assert_eq!(last_data["error"]["type"], "api_error");
         assert!(!events.iter().any(|(e, _)| e == "message_stop"));
         let overview = aggregator.overview();
         assert_eq!((overview.today_calls, overview.today_errors), (1, 1));

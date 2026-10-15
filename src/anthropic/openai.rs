@@ -8,9 +8,8 @@
 //! 这样只会说 OpenAI 协议的客户端（如 Codex CLI，`wire_api = "chat"`）也能
 //! 直接走 Kiro 后端，无需额外的翻译代理进程。
 //!
-//! 说明：内部调用始终以非流式方式执行，`stream: true` 的请求在拿到完整结果后
-//! 合成为 OpenAI 的 `chat.completion.chunk` SSE 序列。对 Codex 这类"拿到结果再
-//! 展示"的客户端，语义与逐 token 流式一致；正确性（含工具调用）完全保留。
+//! Streaming requests translate Anthropic events as they arrive, including
+//! tool arguments, final usage, and abnormal termination.
 
 use std::collections::BTreeMap;
 
@@ -21,6 +20,8 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -113,10 +114,14 @@ pub async fn post_chat_completions(
         }
     };
 
-    // 2. 复用 Anthropic 全链路（内部强制非流式）
+    // 2. Reuse the Anthropic chain with the client's streaming preference.
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
+    if status.is_success() && want_stream {
+        return chat_streaming_response(inner.into_body(), model);
+    }
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -130,11 +135,15 @@ pub async fn post_chat_completions(
 
     // 上游非 2xx：原样透传（Anthropic 错误体已是 {"error":{type,message}} 形状）
     if !status.is_success() {
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body_bytes))
             .unwrap();
+        if let Some(value) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
     }
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
@@ -151,19 +160,8 @@ pub async fn post_chat_completions(
     // 3. Anthropic -> OpenAI 响应翻译
     let parsed = parse_anthropic_message(&anthropic, &model);
 
-    if want_stream {
-        let sse = build_stream_sse(&parsed);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(Body::from(sse))
-            .unwrap()
-    } else {
-        let body = build_completion_json(&parsed);
-        (StatusCode::OK, Json(body)).into_response()
-    }
+    let body = build_completion_json(&parsed);
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ============================ 请求翻译 ============================
@@ -272,7 +270,7 @@ fn openai_to_anthropic(
         model: req.model,
         max_tokens,
         messages,
-        stream: false, // 内部始终非流式
+        stream: req.stream,
         system: if system.is_empty() {
             None
         } else {
@@ -631,7 +629,167 @@ fn build_completion_json(p: &ParsedResponse) -> Value {
     })
 }
 
-/// 把完整结果合成为 OpenAI chat.completion.chunk SSE 序列
+struct ChatStreamContext {
+    id: String,
+    created: i64,
+    model: String,
+    tools: BTreeMap<u64, usize>,
+    usage: serde_json::Map<String, Value>,
+    stop_reason: String,
+    terminal: bool,
+}
+
+impl ChatStreamContext {
+    fn chunk(&self, delta: Value, finish: Option<&str>, usage: Option<Value>) -> Bytes {
+        let mut value = json!({
+            "id": self.id, "object": "chat.completion.chunk", "created": self.created,
+            "model": self.model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        });
+        if let Some(usage) = usage {
+            value["usage"] = usage;
+        }
+        Bytes::from(format!("data: {value}\n\n"))
+    }
+
+    fn fail(&mut self, error: Value) -> Vec<Bytes> {
+        self.terminal = true;
+        vec![Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"error": error})
+        ))]
+    }
+
+    fn handle(&mut self, event: &str, data: Value) -> Vec<Bytes> {
+        if self.terminal {
+            return Vec::new();
+        }
+        if let Some(usage) = data
+            .get("usage")
+            .or_else(|| data.pointer("/message/usage"))
+            .and_then(Value::as_object)
+        {
+            self.usage.extend(usage.clone());
+        }
+        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+        match event {
+            "ping" => vec![Bytes::from_static(b": ping\n\n")],
+            "message_start" => vec![self.chunk(json!({"role": "assistant"}), None, None)],
+            "content_block_start" => {
+                let block = &data["content_block"];
+                match block["type"].as_str() {
+                    Some("tool_use") => {
+                        let tool_index = self.tools.len();
+                        self.tools.insert(index, tool_index);
+                        let input = block
+                            .get("input")
+                            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+                            .map(Value::to_string)
+                            .unwrap_or_default();
+                        vec![self.chunk(
+                            json!({"tool_calls": [{
+                                "index": tool_index, "id": block["id"], "type": "function",
+                                "function": {"name": block["name"], "arguments": input}
+                            }]}),
+                            None,
+                            None,
+                        )]
+                    }
+                    Some("text") if block["text"].as_str().is_some_and(|s| !s.is_empty()) => vec![self.chunk(json!({"content": block["text"]}), None, None)],
+                    _ => Vec::new(),
+                }
+            }
+            "content_block_delta" => match data["delta"]["type"].as_str() {
+                Some("text_delta") => vec![self.chunk(json!({"content": data["delta"]["text"]}), None, None)],
+                Some("input_json_delta") => match self.tools.get(&index) {
+                    Some(tool_index) => vec![self.chunk(json!({"tool_calls": [{"index": tool_index, "function": {"arguments": data["delta"]["partial_json"]}}]}), None, None)],
+                    None => self.fail(json!({"type": "api_error", "message": "Upstream tool delta has no matching tool"})),
+                },
+                _ => Vec::new(),
+            },
+            "message_delta" => {
+                if let Some(reason) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.stop_reason = reason.to_owned();
+                }
+                Vec::new()
+            }
+            "message_stop" => {
+                let parsed = parse_anthropic_message(&json!({"usage": self.usage}), &self.model);
+                let finish = map_finish_reason(&self.stop_reason, !self.tools.is_empty());
+                let chunks = vec![
+                    self.chunk(json!({}), Some(finish), Some(build_usage_json(&parsed))),
+                    Bytes::from_static(b"data: [DONE]\n\n"),
+                ];
+                self.terminal = true;
+                chunks
+            }
+            "error" => self.fail(data.get("error").cloned().unwrap_or_else(|| json!({"type":"api_error", "message":"Upstream stream failed"}))),
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn chat_streaming_response(body: Body, model: String) -> Response {
+    let context = ChatStreamContext {
+        id: new_id(),
+        created: now_ts(),
+        model,
+        tools: BTreeMap::new(),
+        usage: serde_json::Map::new(),
+        stop_reason: "end_turn".to_owned(),
+        terminal: false,
+    };
+    let output = stream::unfold(
+        (
+            body.into_data_stream(),
+            Vec::new(),
+            context,
+            std::collections::VecDeque::new(),
+        ),
+        |(mut body, mut buffer, mut context, mut pending)| async move {
+            loop {
+                if let Some(chunk) = pending.pop_front() {
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(chunk),
+                        (body, buffer, context, pending),
+                    ));
+                }
+                if context.terminal {
+                    return None;
+                }
+                match body.next().await {
+                    Some(Ok(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        for frame in super::responses::take_sse_frames(&mut buffer) {
+                            if context.terminal {
+                                break;
+                            }
+                            match super::responses::parse_sse_frame(&frame) {
+                                Ok(Some((event, data))) => pending.extend(context.handle(&event, data)),
+                                Ok(None) => {},
+                                Err(_) => pending.extend(context.fail(json!({
+                                    "type": "api_error", "message": "Invalid upstream SSE frame"
+                                }))),
+                            }
+                        }
+                    }
+                    Some(Err(_)) | None => pending.extend(context.fail(json!({
+                        "type": "api_error", "message": "Upstream response stream was interrupted"
+                    }))),
+                }
+            }
+        },
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(output))
+        .unwrap()
+}
+
+/// Complete-result SSE fixtures for conversion tests.
+#[cfg(test)]
 fn build_stream_sse(p: &ParsedResponse) -> String {
     let id = new_id();
     let created = now_ts();

@@ -99,7 +99,8 @@ async fn main() {
         .filter(|url| !url.trim().is_empty())
         .map(|url| {
             let mut proxy = http_client::ProxyConfig::new(url);
-            if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password)
+            if let (Some(username), Some(password)) =
+                (&config.proxy_username, &config.proxy_password)
             {
                 proxy = proxy.with_auth(username, password);
             }
@@ -264,23 +265,66 @@ async fn main() {
     }
 
     // CacheMeter：本地计量模拟，支持可选 Redis 共享元数据层；不承载真实 KV Cache。
-    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
+    // 容量 / 落盘 / 落盘间隔 / miss 诊断四项均为「config.json > 环境变量 > 内置默认」，
+    // 在这里解析一次后通过 builder 注入，运行时不可改（改 = 改配置 + 重启）。
+    use anthropic::cache_metering::CacheMeter;
     let cache_metering_enabled = config
         .cache_metering_enabled
-        .or_else(anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
+        .or_else(CacheMeter::metering_enabled_from_env)
         .unwrap_or(true);
+    let cache_metering_capacity = CacheMeter::resolve_capacity(
+        config.cache_metering_capacity,
+        CacheMeter::capacity_from_env(),
+    );
+    let cache_metering_persist = config
+        .cache_metering_persist_enabled
+        .or_else(CacheMeter::persist_enabled_from_env)
+        .unwrap_or(false);
+    let cache_metering_flush_interval = CacheMeter::resolve_flush_interval_secs(
+        config.cache_metering_flush_interval_secs,
+        CacheMeter::flush_interval_from_env(),
+    );
+    let cache_metering_miss_diagnostics = config
+        .cache_metering_miss_diagnostics
+        .or_else(CacheMeter::miss_diagnostics_from_env)
+        .unwrap_or(true);
+
+    let cache_metering_snapshot = cache_dir.join("cache_metering.json");
+    let cache_metering_persist_path = if cache_metering_persist {
+        Some(cache_metering_snapshot.clone())
+    } else {
+        // 关闭时不读、不写，也不删除已有文件（留给回滚）
+        if let Ok(meta) = std::fs::metadata(&cache_metering_snapshot) {
+            tracing::info!(
+                "prompt cache 快照持久化已关闭，忽略 {}（{} 字节）",
+                cache_metering_snapshot.display(),
+                meta.len()
+            );
+        }
+        None
+    };
+
     let cache_meter = std::sync::Arc::new(
-        anthropic::cache_metering::CacheMeter::from_env(Some(
-            cache_dir.join("cache_metering.json"),
-        ))
-        .await
-        .with_enabled(cache_metering_enabled),
+        CacheMeter::from_env(cache_metering_persist_path)
+            .await
+            .with_enabled(cache_metering_enabled)
+            .with_capacity(cache_metering_capacity)
+            .with_flush_interval_secs(cache_metering_flush_interval)
+            .with_miss_diagnostics(cache_metering_miss_diagnostics),
     );
     cache_meter.clone().spawn_background();
     if !cache_metering_enabled {
         tracing::info!("本地 prompt cache 计量模拟已关闭，usage 将全量计入 input_tokens");
     } else {
-        tracing::info!("本地 prompt cache 计量模拟已开启，按真实命中量上报 usage");
+        tracing::info!(
+            "本地 prompt cache 计量模拟已开启：capacity={}（约 {} req/s @ 4 断点 / 300s TTL），\
+             persist={}，flush_interval={}s，miss_diagnostics={}",
+            cache_metering_capacity,
+            cache_metering_capacity / (4 * 300),
+            cache_metering_persist,
+            cache_metering_flush_interval,
+            cache_metering_miss_diagnostics
+        );
     }
 
     // 会话粘性路由：绑定表过期条目定期清理（lookup 只顺手清自己命中的那条）
@@ -371,9 +415,7 @@ async fn main() {
                 .nest("/admin", admin_ui_app)
                 .route(
                     "/admin/",
-                    axum::routing::get(|| async {
-                        axum::response::Redirect::temporary("/admin")
-                    }),
+                    axum::routing::get(|| async { axum::response::Redirect::temporary("/admin") }),
                 )
         }
     } else {

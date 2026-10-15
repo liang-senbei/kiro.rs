@@ -596,12 +596,13 @@ pub struct ConversionResult {
 }
 
 /// Internal conversion purpose. Clients cannot select this directly; the
-/// Responses adapter uses `Compact` only after validating a terminal
+/// Responses adapter uses compact modes only after validating a terminal
 /// `compaction_trigger` item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConversionPurpose {
     Generate,
     Compact,
+    CompactFallback,
 }
 
 const COMPACTION_HISTORY_TOOL_NAME: &str = "kiro_compaction_history_tool";
@@ -711,20 +712,11 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 fn create_compaction_history_tool() -> Tool {
-    Tool {
-        tool_specification: ToolSpecification {
-            name: COMPACTION_HISTORY_TOOL_NAME.to_string(),
-            description: "Inert placeholder for structured tool calls in compacted history. Do not call it."
-                .to_string(),
-            input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": true
-            })),
-        },
-    }
+    let mut tool = create_placeholder_tool(COMPACTION_HISTORY_TOOL_NAME);
+    tool.tool_specification.description =
+        "Inert placeholder for structured tool calls in compacted history. Do not call it."
+            .to_string();
+    tool
 }
 
 fn sorted_ids(ids: &std::collections::HashSet<String>) -> Vec<String> {
@@ -807,22 +799,22 @@ pub(crate) fn convert_request_with_purpose(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
-    let mut tools = if purpose == ConversionPurpose::Compact {
+    let fallback = purpose == ConversionPurpose::CompactFallback;
+    let mut tools = if fallback {
         Vec::new()
     } else {
         convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?
     };
 
     // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
-    let mut known_tool_names: std::collections::HashSet<String> =
-        if purpose == ConversionPurpose::Compact {
-            std::collections::HashSet::new()
-        } else {
-            req.tools
-                .as_ref()
-                .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
-                .unwrap_or_default()
-        };
+    let mut known_tool_names: std::collections::HashSet<String> = if fallback {
+        std::collections::HashSet::new()
+    } else {
+        req.tools
+            .as_ref()
+            .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default()
+    };
     // 建议3 修复：超长工具名（>63）会被 shorten 成短名发给上游，模型回吐的也是短名。
     // tool_name_map 的 key 正是这些短名，一并加入，避免「超长名工具的合法 invoke 被漏捞」。
     for short in tool_name_map.keys() {
@@ -842,7 +834,7 @@ pub(crate) fn convert_request_with_purpose(
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
-    let validated_tool_results = if purpose == ConversionPurpose::Compact {
+    let validated_tool_results = if purpose != ConversionPurpose::Generate {
         validate_compaction_tool_sequence(&history, &tool_results)?;
         tool_results.clone()
     } else {
@@ -862,7 +854,7 @@ pub(crate) fn convert_request_with_purpose(
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
-    if purpose == ConversionPurpose::Compact {
+    if fallback {
         if !history_tool_names.is_empty() {
             tools.push(create_compaction_history_tool());
             known_tool_names.insert(COMPACTION_HISTORY_TOOL_NAME.to_string());
@@ -1871,7 +1863,7 @@ fn build_history(
         let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
 
-        if purpose == ConversionPurpose::Compact {
+        if purpose != ConversionPurpose::Generate {
             return Err(ConversionError::InvalidMessageSequence(
                 "compaction would move an unanswered user message into history".to_string(),
             ));
@@ -1956,7 +1948,7 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let (mapped_name, input) = if purpose
-                                    == ConversionPurpose::Compact
+                                    == ConversionPurpose::CompactFallback
                                 {
                                     (COMPACTION_HISTORY_TOOL_NAME.to_string(), input)
                                 } else {

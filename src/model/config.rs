@@ -108,6 +108,21 @@ pub struct Config {
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
+    /// Deadline for establishing an upstream API connection.
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Maximum silence while waiting for headers or the next upstream body read.
+    #[serde(default = "default_upstream_read_timeout_secs")]
+    pub upstream_read_timeout_secs: u64,
+
+    /// Deadline for a whole upstream API request, body included. An active
+    /// stream cannot reset it, so it also caps how long an answer may be.
+    /// Defaults to 0 (disabled), leaving stalled upstreams to
+    /// `upstream_read_timeout_secs`; set a positive value to cap answer time.
+    #[serde(default = "default_upstream_total_timeout_secs")]
+    pub upstream_total_timeout_secs: u64,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -181,17 +196,24 @@ pub struct Config {
     #[serde(default = "default_session_affinity_ttl_secs")]
     pub session_affinity_ttl_secs: u64,
 
-    /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
+    /// 账号级 429 限流触发时是否冷却当前凭据并故障转移（默认 true）。
     ///
-    /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
-    /// 开启后：识别到 suspicious activity 字符串时，把当前凭据冷却 `account_throttle_cooldown_secs` 秒，
-    /// 立即切换到下一个可用凭据。
+    /// 适用于 USER_REQUEST_RATE_EXCEEDED、CREDIT_CONSUMPTION_RATE_EXCEEDED
+    /// 和 suspicious activity 等明确绑定账号的 429。关闭后直接返回客户端，不会由
+    /// `model_api_429_retry_enabled` 在原账号上继续重试。
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级 429 限流冷却时长（秒，默认 1800 = 30 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
+
+    /// 普通模型 API 429 是否由中转侧自动重试（默认 true）。
+    ///
+    /// 仅控制不需要切换凭据的容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）。
+    /// 关闭后首个普通 429 立即返回客户端；账号级故障转移不受影响。
+    #[serde(default = "default_model_api_429_retry_enabled")]
+    pub model_api_429_retry_enabled: bool,
 
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
@@ -239,6 +261,14 @@ pub struct Config {
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
 
+    /// 是否在上游月度额度重置后自动恢复 `QuotaExceeded` 凭据（默认 false）。
+    ///
+    /// 开启后，后台余额任务仅在该凭据的 `nextResetAt` 到期时复查它自己；确认
+    /// `remaining > 0` 后才恢复调度。关闭时，`QuotaExceeded` 凭据保持禁用，
+    /// 需管理员手动恢复。
+    #[serde(default)]
+    pub quota_reset_recovery_enabled: bool,
+
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -267,6 +297,35 @@ pub struct Config {
     /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metering_enabled: Option<bool>,
+
+    /// prompt cache 计量模拟的条目上限。未设置时回落到 `KIRO_RS_CACHE_CAPACITY`
+    /// 环境变量，再回落到内置默认 262144。
+    ///
+    /// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+    /// 生效值钳到 `[1024, 8388608]`。启动时固定，运行时不可改。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_capacity: Option<usize>,
+
+    /// 是否把 prompt cache 计量快照落到 `cache_metering.json`。未设置时回落到
+    /// `KIRO_RS_CACHE_PERSIST` 环境变量，再回落到默认**关闭**。
+    ///
+    /// 关闭后启动不读该文件、运行与退出都不写该文件，也不会删除已有文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_persist_enabled: Option<bool>,
+
+    /// prompt cache 计量快照的落盘间隔（秒）。未设置时回落到
+    /// `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 环境变量，再回落到默认 300。
+    /// 生效值钳到 `[10, 3600]`。仅在落盘开启时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_flush_interval_secs: Option<u64>,
+
+    /// 是否开启 miss 归因（墓碑表，用于区分 `miss_evicted` / `miss_expired`）。
+    /// 未设置时回落到 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后不建墓碑表（内存归零），`miss_evicted` 退化为 `miss_no_entry`，
+    /// 其余计数器与 `entries_len` 仍然输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_miss_diagnostics: Option<bool>,
 
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
@@ -339,6 +398,21 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_upstream_connect_timeout_secs() -> u64 {
+    15
+}
+/// 720s, the old total deadline: answers that used to finish within it still
+/// do, and only an upstream silent for that long is treated as stalled.
+fn default_upstream_read_timeout_secs() -> u64 {
+    720
+}
+/// No overall deadline by default: an active stream must never be cut off
+/// mid-answer (effort=max generations routinely run for many minutes). A
+/// stalled upstream is still caught by `upstream_read_timeout_secs`.
+fn default_upstream_total_timeout_secs() -> u64 {
+    0
+}
+
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
@@ -357,6 +431,10 @@ fn default_account_throttle_failover() -> bool {
 
 fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
+}
+
+fn default_model_api_429_retry_enabled() -> bool {
+    true
 }
 
 fn default_account_rpm_limit_enabled() -> bool {
@@ -429,6 +507,9 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_total_timeout_secs: default_upstream_total_timeout_secs(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -446,17 +527,23 @@ impl Default for Config {
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
+            quota_reset_recovery_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             cache_metering_enabled: None,
+            cache_metering_capacity: None,
+            cache_metering_persist_enabled: None,
+            cache_metering_flush_interval_secs: None,
+            cache_metering_miss_diagnostics: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
@@ -534,6 +621,48 @@ mod tests {
     use super::Config;
 
     #[test]
+    fn upstream_deadlines_default_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 15);
+        assert_eq!(config.upstream_read_timeout_secs, 720);
+        assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
+        assert_eq!(Config::default().upstream_read_timeout_secs, 720);
+    }
+
+    /// No overall deadline by default, so long generations are never cut off
+    /// mid-answer; the read idle deadline still catches a stalled upstream.
+    #[test]
+    fn upstream_total_timeout_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 0);
+    }
+
+    #[test]
+    fn upstream_deadlines_accept_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45}"#,
+        )
+        .unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 7);
+        assert_eq!(config.upstream_read_timeout_secs, 45);
+    }
+
+    #[test]
+    fn upstream_total_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":1800}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1800);
+    }
+
+    /// 0 is a meaningful setting, not a missing one: it turns the overall
+    /// deadline off for deployments that would rather let long answers finish.
+    #[test]
+    fn upstream_total_timeout_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+    }
+
+    #[test]
     fn model_cache_ttl_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.model_cache_ttl_secs, 3600);
@@ -579,6 +708,14 @@ mod tests {
     }
 
     #[test]
+    fn quota_reset_recovery_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.quota_reset_recovery_enabled);
+        let config: Config = serde_json::from_str(r#"{"quotaResetRecoveryEnabled":true}"#).unwrap();
+        assert!(config.quota_reset_recovery_enabled);
+    }
+
+    #[test]
     fn account_rpm_limit_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(!config.account_rpm_limit_enabled);
@@ -587,6 +724,19 @@ mod tests {
         let default = Config::default();
         assert!(!default.account_rpm_limit_enabled);
         assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn model_api_429_retry_defaults_to_enabled_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.model_api_429_retry_enabled);
+        assert!(Config::default().model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_retry_accepts_explicitly_disabled() {
+        let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        assert!(!config.model_api_429_retry_enabled);
     }
 
     #[test]

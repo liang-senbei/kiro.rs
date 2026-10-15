@@ -52,6 +52,7 @@ interface TopbarToolsProps {
 const NON_DATA_QUERY_ROOTS = new Set([
   'loadBalancingMode',
   'accountThrottleConfig',
+  'modelApiRetryConfig',
   'accountRpmLimitConfig',
   'selfHealConfig',
   'logGovernanceConfig',
@@ -135,8 +136,8 @@ export function TopbarTools({ compact }: TopbarToolsProps) {
       label: thLoading ? '加载中…' : failover ? `故障转移 · ${cooldownMin}m` : '不切换',
       menuLabel: failover ? '关闭故障转移' : '开启故障转移',
       title: failover
-        ? `账号级风控故障转移：开启（冷却 ${cooldownMin} 分钟，可在设置页调整）`
-        : '账号级风控故障转移：关闭',
+        ? `账号级 429 故障转移：开启（冷却 ${cooldownMin} 分钟，可在设置页调整）`
+        : '账号级 429 故障转移：关闭',
       icon: failover ? (
         <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
       ) : (

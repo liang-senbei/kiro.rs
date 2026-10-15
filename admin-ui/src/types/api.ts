@@ -91,7 +91,7 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
-  /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
+  /** 账号级限流冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
@@ -667,7 +667,7 @@ export interface TracePage {
   total: number
 }
 
-/** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */
+/** 单凭据失败分类计数（鉴权 / 账号限流 / 其他） */
 export interface FailureStats {
   auth: number
   throttle: number

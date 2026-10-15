@@ -54,7 +54,7 @@ use super::openai::{
     resolve_session_metadata,
 };
 use super::types::{
-    Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
+    CacheControl, Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
 };
 
 #[path = "responses_compaction.rs"]
@@ -253,6 +253,7 @@ pub async fn post_responses(
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
     if !status.is_success() {
         let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
             Ok(b) => b,
@@ -264,11 +265,15 @@ pub async fn post_responses(
                 );
             }
         };
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body_bytes))
             .unwrap();
+        if let Some(value) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
     }
 
     if want_stream {
@@ -310,6 +315,16 @@ fn responses_to_anthropic(
     req: ResponsesRequest,
     metadata: Option<Metadata>,
 ) -> Result<(MessagesRequest, ToolKindMap), String> {
+    // OpenAI Responses 默认采用隐式 prompt caching，但 Codex 当前只发送稳定的
+    // prompt_cache_key，不会发送 Anthropic 风格的 block 断点。metadata 只会在
+    // prompt_cache_key / 会话请求头成功解析为 UUID 后存在；此时为 Responses 路径
+    // 合成顶层自动断点。这里按协议而不是模型厂商判断，因此 Codex 通过 Responses
+    // 调用 GPT 或 Claude 都能恢复本地模拟计量；原生 /v1/messages 路径不受影响。
+    // 该字段不会被 converter 转发给 Kiro provider。
+    let cache_control = metadata.as_ref().map(|_| CacheControl {
+        cache_type: "ephemeral".to_string(),
+        ttl: None,
+    });
     let max_tokens = req
         .max_output_tokens
         .filter(|v| *v > 0)
@@ -464,7 +479,7 @@ fn responses_to_anthropic(
             thinking,
             output_config,
             metadata,
-            cache_control: None,
+            cache_control,
         },
         tool_kinds,
     ))
@@ -1878,7 +1893,7 @@ fn responses_streaming_response(
         .unwrap()
 }
 
-fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+pub(super) fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     loop {
         let lf = buffer.windows(2).position(|window| window == b"\n\n");
@@ -1902,7 +1917,7 @@ fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     frames
 }
 
-fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
+pub(super) fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
     let text = std::str::from_utf8(frame)
         .map_err(|error| format!("upstream sent invalid UTF-8 SSE: {error}"))?;
     let mut event = None;
@@ -2233,10 +2248,16 @@ mod tests {
         assert_eq!(
             anthropic
                 .metadata
-                .and_then(|value| value.user_id)
-                .as_deref(),
+                .as_ref()
+                .and_then(|value| value.user_id.as_deref()),
             Some("session_550e8400-e29b-41d4-a716-446655440000")
         );
+        let cache_control = anthropic
+            .cache_control
+            .as_ref()
+            .expect("合法 Codex session 应开启内部自动缓存计量");
+        assert_eq!(cache_control.cache_type, "ephemeral");
+        assert_eq!(cache_control.ttl, None);
     }
 
     #[test]
@@ -2254,10 +2275,11 @@ mod tests {
         assert_eq!(
             anthropic
                 .metadata
-                .and_then(|value| value.user_id)
-                .as_deref(),
+                .as_ref()
+                .and_then(|value| value.user_id.as_deref()),
             Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
         );
+        assert!(anthropic.cache_control.is_some());
 
         let req = req_with(json!([]), simple_input());
         headers.insert("x-client-request-id", "invalid".parse().unwrap());
@@ -2265,6 +2287,67 @@ mod tests {
         assert!(metadata.is_none());
         let (anthropic, _) = responses_to_anthropic(req, metadata).unwrap();
         assert!(anthropic.metadata.is_none());
+        assert!(
+            anthropic.cache_control.is_none(),
+            "无合法 session 时不得跨请求模拟缓存"
+        );
+    }
+
+    #[test]
+    fn responses_session_enables_cache_meter_first_write_then_read() {
+        use super::super::cache_metering::{CacheMeter, compute_cache_usage_sync};
+
+        fn converted_request(input: Value) -> MessagesRequest {
+            let req: ResponsesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.6-sol",
+                "instructions": "stable developer context ".repeat(100),
+                "input": input,
+                "prompt_cache_key": "550e8400-e29b-41d4-a716-446655440000"
+            }))
+            .unwrap();
+            let metadata =
+                resolve_session_metadata(req.prompt_cache_key.as_deref(), &HeaderMap::new());
+            responses_to_anthropic(req, metadata).unwrap().0
+        }
+
+        let cache = CacheMeter::new(None);
+        let first_request = converted_request(json!([
+            {"type": "message", "role": "user", "content": "question one"}
+        ]));
+        let first = compute_cache_usage_sync(&cache, &first_request, 0);
+        assert!(first.cache_covered_est > 0);
+        assert_eq!(first.cache_read, 0);
+
+        let second_request = converted_request(json!([
+            {"type": "message", "role": "user", "content": "question one"},
+            {"type": "message", "role": "assistant", "content": "answer one"},
+            {"type": "message", "role": "user", "content": "question two"}
+        ]));
+        let second = compute_cache_usage_sync(&cache, &second_request, 0);
+        assert_eq!(second.cache_read, first.cache_covered_est);
+        assert!(
+            second.cache_covered_est > second.cache_read,
+            "第二轮应读取旧前缀并写入新增历史，而不是把当前提问计入缓存"
+        );
+    }
+
+    #[test]
+    fn responses_session_enables_top_level_cache_for_claude_too() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "input": simple_input(),
+            "prompt_cache_key": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .unwrap();
+        let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &HeaderMap::new());
+        let (anthropic, _) = responses_to_anthropic(req, metadata).unwrap();
+
+        assert!(anthropic.metadata.is_some());
+        let cache_control = anthropic
+            .cache_control
+            .expect("Codex 通过 Responses 调用 Claude 时也应启用内部模拟缓存");
+        assert_eq!(cache_control.cache_type, "ephemeral");
+        assert_eq!(cache_control.ttl, None);
     }
 
     fn parsed_with_tool_calls(tool_calls: Vec<Value>) -> ParsedResponse {
@@ -3162,6 +3245,12 @@ mod tests {
         let usage = context.usage();
         assert_eq!(usage["input_tokens"], json!(14));
         assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(7));
+        assert!(
+            usage["input_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none(),
+            "暂不扩展 Responses usage 的 cache-write 字段"
+        );
         assert_eq!(usage["output_tokens"], json!(5));
         assert_eq!(usage["total_tokens"], json!(19));
     }
@@ -3391,6 +3480,11 @@ mod tests {
             view.usage["input_tokens_details"]["cached_tokens"],
             json!(7)
         );
+        assert!(
+            view.usage["input_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none()
+        );
         assert_eq!(view.usage["output_tokens"], json!(5));
         assert_eq!(view.usage["total_tokens"], json!(19));
 
@@ -3401,6 +3495,11 @@ mod tests {
             .expect("response.completed data line");
         let event: Value = serde_json::from_str(completed.trim_start_matches("data: ")).unwrap();
         assert_eq!(event["response"]["usage"], view.usage);
+        assert!(
+            event["response"]["usage"]["input_tokens_details"]
+                .get("cache_write_tokens")
+                .is_none()
+        );
     }
 
     // ---- credit_usage 透传 ----

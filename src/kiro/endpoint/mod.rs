@@ -37,7 +37,7 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// 装饰 API 请求的端点特有 header
     ///
-    /// Provider 已经设置好 URL、content-type、Connection 和 body；
+    /// Provider 已经设置好 URL、content-type 和 body；
     /// 实现负责追加 Authorization、host、user-agent 等端点相关头。
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
@@ -62,12 +62,12 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_bearer_token_invalid(body)
     }
 
-    /// 判断响应体是否表示"账号级临时风控"（429 + suspicious activity）
+    /// 判断响应体是否表示账号级 429 限流。
     ///
-    /// 与普通 429（high traffic）区分：账号级风控只针对当前凭据生效，
-    /// 故障转移到其它凭据后可立即恢复；普通 429 是上游全局过载，切换无意义。
-    fn is_account_throttled(&self, body: &str) -> bool {
-        default_is_account_throttled(body)
+    /// 账号级限流可通过冷却当前凭据并故障转移恢复；模型容量不足等普通 429
+    /// 与凭据无关，应留在当前凭据上退避重试。
+    fn is_account_rate_limited(&self, body: &str) -> bool {
+        default_is_account_rate_limited(body)
     }
 
     /// 判断响应体是否表示"账号级突发限流"（429 + `USER_REQUEST_RATE_EXCEEDED`）
@@ -159,17 +159,40 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
     body.contains("The bearer token included in the request is invalid")
 }
 
-/// 默认的账号级风控判断逻辑
+/// 默认的账号级 429 限流判断逻辑。
 ///
-/// 上游 Kiro/Q-Developer 风控会返回 429 + 类似：
-/// `Due to suspicious activity, we are imposing temporary limits on how
-/// frequently your account (d-...) can send a request to Kiro while we investigate.`
-///
-/// 与普通 429（high traffic / rate limit exceeded）的关键差异是
-/// 提到 "suspicious activity" 与具体账号 ID。
-pub fn default_is_account_throttled(body: &str) -> bool {
-    body.contains("suspicious activity")
-        && body.contains("temporary limits")
+/// 优先按上游 JSON 的 `reason` 分类；老版本无 reason 的响应再按高特异文案兼容。
+/// `INSUFFICIENT_MODEL_CAPACITY` 等容量类错误不会命中。
+pub fn default_is_account_rate_limited(body: &str) -> bool {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let reason = parsed
+        .as_ref()
+        .and_then(|value| value.get("reason"))
+        .and_then(|value| value.as_str());
+    if reason.is_some_and(|reason| {
+        matches!(
+            reason,
+            "USER_REQUEST_RATE_EXCEEDED"
+                | "CREDIT_CONSUMPTION_RATE_EXCEEDED"
+                | "SERVICE_REQUEST_RATE_EXCEEDED"
+        )
+    }) {
+        return true;
+    }
+
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(body)
+        .trim();
+    let message_lower = message.to_ascii_lowercase();
+
+    (message_lower.contains("suspicious activity")
+        && message_lower.contains("temporary limits"))
+        || message_lower.contains("5-minute credit limit exceeded")
+        || message_lower.trim_end_matches('.')
+            == "too many requests, please wait before trying again"
 }
 
 /// 默认的"账号级突发限流"判断逻辑
@@ -412,15 +435,39 @@ mod tests {
     }
 
     #[test]
-    fn test_default_is_account_throttled() {
+    fn test_default_is_account_rate_limited() {
         let body = r#"{"message":"Due to suspicious activity, we are imposing temporary limits on how frequently your account (d-9067c98495.84f894a8) can send a request to Kiro while we investigate.","reason":null}"#;
-        assert!(default_is_account_throttled(body));
-        // 普通 429 不应被识别为账号风控
-        assert!(!default_is_account_throttled(
+        assert!(default_is_account_rate_limited(body));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":"CREDIT_CONSUMPTION_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"5-minute credit limit exceeded","reason":null}"#
+        ));
+        assert!(default_is_account_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":null}"#
+        ));
+
+        // 模型容量类 429 不应触发换号。
+        assert!(!default_is_account_rate_limited(
+            r#"{"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
+        ));
+        assert!(!default_is_account_rate_limited(
+            r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
+        assert!(!default_is_account_rate_limited(
             "{\"message\":\"Too many requests\"}"
         ));
         // 仅有一半关键词时也不命中
-        assert!(!default_is_account_throttled("suspicious activity detected"));
+        assert!(!default_is_account_rate_limited(
+            "suspicious activity detected"
+        ));
     }
 
     #[test]

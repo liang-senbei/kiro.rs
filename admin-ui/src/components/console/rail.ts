@@ -99,6 +99,7 @@ export function outcomeTone(outcome: string): RailTone {
       return 'ok'
     case 'quota_exhausted':
     case 'stream_interrupted':
+    case 'abandoned_before_headers':
       return 'warn'
     case 'account_throttled':
       return 'cool'

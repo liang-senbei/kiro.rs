@@ -158,7 +158,7 @@ export async function forceRefreshToken(
   return data
 }
 
-// 解除凭据的账号级风控冷却
+// 解除凭据的账号级限流冷却
 export async function clearThrottle(id: number): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/clear-throttle`)
   return data
@@ -453,17 +453,35 @@ export interface AccountThrottleConfig {
   cooldownSecs: number
 }
 
-// 获取账号级风控故障转移配置
+// 获取账号级 429 限流故障转移配置
 export async function getAccountThrottleConfig(): Promise<AccountThrottleConfig> {
   const { data } = await api.get<AccountThrottleConfig>('/config/account-throttle')
   return data
 }
 
-// 更新账号级风控故障转移配置
+// 更新账号级 429 限流故障转移配置
 export async function setAccountThrottleConfig(
   patch: Partial<AccountThrottleConfig>,
 ): Promise<AccountThrottleConfig> {
   const { data } = await api.put<AccountThrottleConfig>('/config/account-throttle', patch)
+  return data
+}
+
+export interface ModelApiRetryConfig {
+  enabled: boolean
+}
+
+// 获取普通模型 API 429 自动重试配置
+export async function getModelApiRetryConfig(): Promise<ModelApiRetryConfig> {
+  const { data } = await api.get<ModelApiRetryConfig>('/config/model-api-retry')
+  return data
+}
+
+// 更新普通模型 API 429 自动重试配置
+export async function setModelApiRetryConfig(
+  config: ModelApiRetryConfig,
+): Promise<ModelApiRetryConfig> {
+  const { data } = await api.put<ModelApiRetryConfig>('/config/model-api-retry', config)
   return data
 }
 
@@ -483,6 +501,22 @@ export async function setAccountRpmLimitConfig(
   patch: Partial<AccountRpmLimitConfig>,
 ): Promise<AccountRpmLimitConfig> {
   const { data } = await api.put<AccountRpmLimitConfig>('/config/account-rpm-limit', patch)
+  return data
+}
+
+export interface QuotaResetRecoveryConfig {
+  enabled: boolean
+}
+
+export async function getQuotaResetRecoveryConfig(): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.get<QuotaResetRecoveryConfig>('/config/quota-reset-recovery')
+  return data
+}
+
+export async function setQuotaResetRecoveryConfig(
+  patch: Partial<QuotaResetRecoveryConfig>,
+): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.put<QuotaResetRecoveryConfig>('/config/quota-reset-recovery', patch)
   return data
 }
 

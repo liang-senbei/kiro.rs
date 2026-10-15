@@ -28,6 +28,7 @@ use super::{
         SetGlobalProxyRequest,
         SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -143,13 +144,13 @@ pub async fn reset_failure_count(
 }
 
 /// POST /api/admin/credentials/:id/clear-throttle
-/// 手动解除凭据的账号级风控冷却
+/// 手动解除凭据的账号级限流冷却
 pub async fn clear_throttle(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.clear_throttle(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 限流冷却已解除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -570,18 +571,36 @@ pub async fn set_load_balancing_mode(
 }
 
 /// GET /api/admin/config/account-throttle
-/// 获取账号级风控故障转移配置
+/// 获取账号级 429 限流故障转移配置
 pub async fn get_account_throttle_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_account_throttle_config())
 }
 
 /// PUT /api/admin/config/account-throttle
-/// 更新账号级风控故障转移配置
+/// 更新账号级 429 限流故障转移配置
 pub async fn set_account_throttle_config(
     State(state): State<AdminState>,
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/model-api-retry
+/// 获取普通模型 API 429 自动重试配置
+pub async fn get_model_api_retry_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_api_retry_config())
+}
+
+/// PUT /api/admin/config/model-api-retry
+/// 更新普通模型 API 429 自动重试配置
+pub async fn set_model_api_retry_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetModelApiRetryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_model_api_retry_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -602,6 +621,22 @@ pub async fn set_account_rpm_limit_config(
     match state.service.set_account_rpm_limit_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/quota-reset-recovery
+pub async fn get_quota_reset_recovery_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_quota_reset_recovery_config())
+}
+
+/// PUT /api/admin/config/quota-reset-recovery
+pub async fn set_quota_reset_recovery_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetQuotaResetRecoveryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_quota_reset_recovery_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

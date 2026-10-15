@@ -2,7 +2,7 @@
 //!
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
-use reqwest::{Client, ClientBuilder, Proxy};
+use reqwest::{Client, Proxy};
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -49,46 +49,42 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
-    finish_client(builder, proxy, tls_backend)
+    Ok(client_builder(proxy, tls_backend)?
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()?)
 }
 
-/// 上游模型调用 Client 的建连超时
-const STREAMING_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// 上游模型调用 Client 的读空闲超时：等响应头、或响应体相邻两次读到数据之间最多等这么久。
+/// API streams need separate connection and idle deadlines; active reads reset
+/// the idle timer, so upstream silence is bounded without bounding the answer.
 ///
-/// 取原来的总超时值：以前能在总超时内完成的请求不受影响，一直在出数据的长输出不再被掐断。
-const STREAMING_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(720);
+/// `total_secs` is the deadline for the whole request, body included. It is a
+/// wall clock that an active stream cannot reset, so any overall budget doubles
+/// as a cap on answer length: a request still delivering tokens at the deadline
+/// dies with a half-written body, and every token already generated is paid for
+/// and lost. Pass 0 to drop that cap — a stalled upstream is still caught by
+/// `read_secs`, which measures silence rather than total work.
+pub fn build_client_with_timeouts(
+    proxy: Option<&ProxyConfig>,
+    total_secs: u64,
+    tls_backend: TlsBackend,
+    connect_secs: u64,
+    read_secs: u64,
+) -> anyhow::Result<Client> {
+    let mut builder = client_builder(proxy, tls_backend)?
+        .connect_timeout(Duration::from_secs(connect_secs.max(1)))
+        .read_timeout(Duration::from_secs(read_secs.max(1)));
+    if total_secs > 0 {
+        builder = builder.timeout(Duration::from_secs(total_secs));
+    }
+    Ok(builder.build()?)
+}
 
-/// 构建上游模型调用（generateAssistantResponse / MCP）用的 HTTP Client
-///
-/// 不设总超时：总超时包含读响应体的时间，长输出（effort=max 时常见数分钟）会在
-/// 生成途中被掐断。改为建连超时 + 读空闲超时，只有上游真的停住不动才算超时。
-pub fn build_streaming_client(
+fn client_builder(
     proxy: Option<&ProxyConfig>,
     tls_backend: TlsBackend,
-) -> anyhow::Result<Client> {
-    let builder = streaming_client_builder(STREAMING_CONNECT_TIMEOUT, STREAMING_READ_IDLE_TIMEOUT);
-    finish_client(builder, proxy, tls_backend)
-}
+) -> anyhow::Result<reqwest::ClientBuilder> {
+    let mut builder = Client::builder();
 
-/// 上游模型调用 Client 的超时配置（测试用它注入短超时）
-fn streaming_client_builder(
-    connect_timeout: Duration,
-    read_idle_timeout: Duration,
-) -> ClientBuilder {
-    Client::builder()
-        .connect_timeout(connect_timeout)
-        .read_timeout(read_idle_timeout)
-}
-
-/// 统一设置 TLS 后端与代理并构建 Client
-fn finish_client(
-    mut builder: ClientBuilder,
-    proxy: Option<&ProxyConfig>,
-    tls_backend: TlsBackend,
-) -> anyhow::Result<Client> {
     match tls_backend {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
@@ -120,7 +116,7 @@ fn finish_client(
         );
     }
 
-    Ok(builder.build()?)
+    Ok(builder)
 }
 
 /// 日志用：隐藏代理 URL 中内嵌的 `user:pass@` 凭据
@@ -147,6 +143,8 @@ pub fn redact_proxy_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_proxy_config_new() {
@@ -178,100 +176,142 @@ mod tests {
     }
 
     #[test]
-    fn test_build_streaming_client() {
-        assert!(build_streaming_client(None, TlsBackend::Rustls).is_ok());
+    fn test_build_client_with_timeouts_and_proxy_auth() {
+        assert!(build_client_with_timeouts(None, 0, TlsBackend::Rustls, 15, 720).is_ok());
         let config = ProxyConfig::new("socks5://127.0.0.1:1080").with_auth("user", "pass");
-        assert!(build_streaming_client(Some(&config), TlsBackend::Rustls).is_ok());
+        assert!(build_client_with_timeouts(Some(&config), 0, TlsBackend::Rustls, 15, 720).is_ok());
     }
 
-    /// 起一个只服务一次的本地上游：等 `header_delay` 后发响应头，再每隔 `chunk_interval`
-    /// 发一个 1 字节的 chunk，共 `chunks` 个；`stall_after` 为 true 时发完不收尾、挂住连接。
-    async fn spawn_upstream(
-        header_delay: Duration,
-        chunk_interval: Duration,
-        chunks: usize,
-        stall_after: bool,
-    ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    /// The read idle deadline also bounds the wait for response headers: an
+    /// upstream that accepts the request but never answers fails `send()` itself.
+    #[tokio::test]
+    async fn read_timeout_bounds_wait_for_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let _ = socket.set_nodelay(true);
-            // 读完请求头
-            let mut request = Vec::new();
-            let mut buf = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match socket.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => request.extend_from_slice(&buf[..n]),
-                }
-            }
-            tokio::time::sleep(header_delay).await;
-            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-            if socket.write_all(head.as_bytes()).await.is_err() {
-                return;
-            }
-            for _ in 0..chunks {
-                tokio::time::sleep(chunk_interval).await;
-                if socket.write_all(b"1\r\nx\r\n").await.is_err() {
-                    return;
-                }
-            }
-            if stall_after {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            } else {
-                let _ = socket.write_all(b"0\r\n\r\n").await;
-            }
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        format!("http://{addr}/")
-    }
-
-    /// 与 build_streaming_client 同一套超时配置，读空闲超时换成 `read_idle`；
-    /// 不走系统代理，免得代理环境变量把 127.0.0.1 的请求带走
-    fn short_idle_client(read_idle: Duration) -> Client {
-        streaming_client_builder(Duration::from_secs(5), read_idle)
+        let client = client_builder(None, TlsBackend::Rustls)
+            .unwrap()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_millis(600))
             .no_proxy()
             .build()
+            .unwrap();
+
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("headers that never arrive must hit the idle deadline");
+        assert!(err.is_timeout(), "expected a timeout, got: {err}");
+    }
+
+    /// Serves one chunked response that stays active the whole time: a chunk,
+    /// a `gap` pause, then a final chunk. Never silent for longer than `gap`,
+    /// so an idle deadline above `gap` must not fire.
+    async fn serve_one_slow_stream(gap: Duration) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(gap).await;
+            socket.write_all(b"2\r\nho\r\n0\r\n\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        addr
+    }
+
+    /// The regression: a stream that keeps delivering must not be cut by the
+    /// overall deadline. 0 means "no overall deadline"; the idle deadline
+    /// still guards a stalled upstream.
+    #[tokio::test]
+    async fn active_stream_outlives_disabled_total_timeout() {
+        let addr = serve_one_slow_stream(Duration::from_secs(2)).await;
+        let client = build_client_with_timeouts(None, 0, TlsBackend::Rustls, 15, 120).unwrap();
+
+        let body = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
             .unwrap()
+            .text()
+            .await
+            .expect("active stream must not be cut short");
+        assert_eq!(body, "hiho");
     }
 
-    /// 测试用的读空闲超时
-    const READ_IDLE: Duration = Duration::from_millis(600);
-
-    #[tokio::test]
-    async fn test_streaming_client_keeps_active_stream_past_read_idle() {
-        // 一直在出数据的流：总耗时远超读空闲超时也不能被掐断（旧的总超时会在这里掐断）
-        let url = spawn_upstream(Duration::ZERO, Duration::from_millis(60), 25, false).await;
-        let client = short_idle_client(READ_IDLE);
-        let start = std::time::Instant::now();
-        let resp = client.get(url).send().await.unwrap();
-        let body = resp.bytes().await.unwrap();
-        let elapsed = start.elapsed();
-        assert_eq!(body.len(), 25);
-        assert!(elapsed > READ_IDLE * 2, "elapsed={elapsed:?}");
+    /// Serves headers and one chunk, then holds the connection open and silent.
+    /// Models the case the idle deadline exists for: an upstream that stopped
+    /// producing without closing the socket.
+    async fn serve_one_stalled_stream() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut discard = [0u8; 1024];
+            let _ = socket.read(&mut discard).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            // Never write again, never close: hold the socket past the test.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        addr
     }
 
+    /// Disabling the overall deadline must not disable stall detection: the
+    /// idle deadline still cuts an upstream that went quiet. This is what makes
+    /// 0 a safe setting rather than an unbounded wait.
     #[tokio::test]
-    async fn test_streaming_client_times_out_stalled_body() {
-        // 发了一个 chunk 后上游停住不动：读空闲超时到点报超时，而不是一直挂着
-        let url = spawn_upstream(Duration::ZERO, Duration::ZERO, 1, true).await;
-        let client = short_idle_client(READ_IDLE);
-        let resp = client.get(url).send().await.unwrap();
-        let err = resp.bytes().await.unwrap_err();
-        assert!(err.is_timeout(), "{err:?}");
+    async fn stalled_stream_is_cut_by_read_timeout_without_total_timeout() {
+        let addr = serve_one_stalled_stream().await;
+        let client = build_client_with_timeouts(None, 0, TlsBackend::Rustls, 15, 1).unwrap();
+
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .expect_err("a silent upstream must still be cut by the idle deadline");
+        assert!(err.is_timeout(), "expected a timeout, got: {err}");
     }
 
+    /// A non-zero overall deadline still applies, for callers that want one.
     #[tokio::test]
-    async fn test_streaming_client_times_out_waiting_for_headers() {
-        // 读空闲超时同样管等响应头：上游迟迟不回响应头，send() 本身就报超时
-        let url = spawn_upstream(Duration::from_secs(30), Duration::ZERO, 0, false).await;
-        let client = short_idle_client(READ_IDLE);
-        let err = client.get(url).send().await.unwrap_err();
-        assert!(err.is_timeout(), "{err:?}");
+    async fn total_timeout_still_applies_when_set() {
+        let addr = serve_one_slow_stream(Duration::from_secs(2)).await;
+        let client = build_client_with_timeouts(None, 1, TlsBackend::Rustls, 15, 120).unwrap();
+
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .expect_err("overall deadline must still cut the stream");
+        assert!(err.is_timeout(), "expected a timeout, got: {err}");
     }
 
     #[test]

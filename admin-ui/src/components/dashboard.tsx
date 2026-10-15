@@ -2048,7 +2048,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 tone: "cool",
                 active: stateFilter === "throttled",
                 onClick: () => setStateFilter("throttled"),
-                hint: "账号级风控冷却中，到期自动恢复",
+                hint: "账号级限流冷却中，到期自动恢复",
               },
               {
                 label: "超额",
