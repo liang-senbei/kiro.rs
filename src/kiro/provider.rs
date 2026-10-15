@@ -13,6 +13,7 @@ use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_streaming_client};
+use crate::kiro::burst_pacer::BurstPacer;
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::{UpstreamContextOverflowError, UpstreamRateLimitError};
 use crate::kiro::machine_id;
@@ -30,6 +31,16 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
+
+/// 单个请求因账号突发限流（`USER_REQUEST_RATE_EXCEEDED`）排队等候的累计上限。
+///
+/// 这类等待不占用 `MAX_TOTAL_RETRIES`：同一凭据被多个客户端共用时，突发过后大约每秒
+/// 只放行一个请求，按次数算的重试预算（约 4 秒）排不到就会整批 429。超过上限仍拿不到
+/// 名额才把 429 返回客户端。
+const BURST_LIMIT_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// 单个请求因突发限流换号 / 排队重发的次数上限（兜底，正常由 `BURST_LIMIT_MAX_WAIT` 先触发）
+const BURST_LIMIT_MAX_REQUEUES: usize = 64;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -123,6 +134,8 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// 账号级突发限流后按凭据排队放行
+    burst_pacer: BurstPacer,
 }
 
 impl KiroProvider {
@@ -163,7 +176,41 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            burst_pacer: BurstPacer::new(),
         }
+    }
+
+    /// 凭据刚被突发限流时按队列等到放行时刻。
+    ///
+    /// `waited` 累计本请求已排队的时长；再等就超过 [`BURST_LIMIT_MAX_WAIT`] 时不等，
+    /// 返回带 Retry-After 的限流错误。
+    async fn wait_for_burst_slot(
+        &self,
+        credential_id: u64,
+        waited: &mut Duration,
+    ) -> Result<(), UpstreamRateLimitError> {
+        let Some(release_at) = self.burst_pacer.reserve(credential_id, Instant::now()) else {
+            return Ok(());
+        };
+        let wait = release_at.saturating_duration_since(Instant::now());
+        if *waited + wait > BURST_LIMIT_MAX_WAIT {
+            let retry_after = wait.as_secs().max(1);
+            tracing::warn!(
+                "凭据 #{} 突发限流排队已 {:.1}s，还需等 {:.1}s，超过上限，返回 429",
+                credential_id,
+                waited.as_secs_f32(),
+                wait.as_secs_f32()
+            );
+            return Err(UpstreamRateLimitError::new(Some(retry_after.to_string())));
+        }
+        tracing::debug!(
+            "凭据 #{} 突发限流排队 {:.1}s 后发送",
+            credential_id,
+            wait.as_secs_f32()
+        );
+        sleep(wait).await;
+        *waited += wait;
+        Ok(())
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -360,6 +407,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut burst_waited = Duration::ZERO;
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
@@ -414,6 +462,21 @@ impl KiroProvider {
                     attempt_start,
                 );
                 return Err(e);
+            }
+
+            // MCP 与模型调用共用账号的请求速率：凭据刚被突发限流时同样排队
+            if let Err(rate_limit) = self.wait_for_burst_slot(ctx.id, &mut burst_waited).await {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    "",
+                    None,
+                    outcome::TRANSIENT,
+                    Some(&rate_limit.to_string()),
+                    attempt_start,
+                );
+                return Err(rate_limit.into());
             }
 
             let config = self.token_manager.config();
@@ -647,6 +710,9 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
+                if status.as_u16() == 429 && endpoint.is_burst_rate_limited(&body) {
+                    self.burst_pacer.on_limited(ctx.id, Instant::now());
+                }
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
                         return Err(rate_limit.into());
@@ -727,7 +793,18 @@ impl KiroProvider {
         // 尝试从请求体中提取模型与会话标识
         let (model, session_id) = Self::extract_routing_hints(request_body);
 
-        for attempt in 0..max_retries {
+        // 普通失败消耗 max_retries 预算；账号突发限流后的换号 / 排队重发不消耗，
+        // 只受 BURST_LIMIT_MAX_WAIT 与 BURST_LIMIT_MAX_REQUEUES 约束。
+        let mut budget_used = 0usize;
+        let mut next_attempt = 0usize;
+        let mut burst_waited = Duration::ZERO;
+        let mut burst_requeues = 0usize;
+
+        while budget_used < max_retries {
+            // 本请求内的尝试序号（trace 用）；有突发限流重发时会大于 budget_used
+            let attempt = next_attempt;
+            next_attempt += 1;
+            budget_used += 1;
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
             let mut ctx = match self
@@ -785,6 +862,15 @@ impl KiroProvider {
                 return Err(e);
             }
 
+            // 凭据刚被突发限流：按队列等到放行时刻再发，避免被拒的请求同时重发再次撞墙
+            if let Err(rate_limit) = self.wait_for_burst_slot(ctx.id, &mut burst_waited).await {
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, "", None, outcome::TRANSIENT,
+                    Some(&rate_limit.to_string()), attempt_start,
+                );
+                return Err(rate_limit.into());
+            }
+
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
 
@@ -836,7 +922,7 @@ impl KiroProvider {
                 Err(e) => {
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
+                        budget_used,
                         max_retries,
                         e
                     );
@@ -858,7 +944,7 @@ impl KiroProvider {
                     }
 
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
+                    if budget_used < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;
@@ -877,6 +963,7 @@ impl KiroProvider {
                 );
                 self.token_manager
                     .report_success_for_request(ctx.id, model.as_deref());
+                self.burst_pacer.on_accepted(ctx.id);
                 // 上游接受了请求才把会话钉到这个凭据，失败的凭据不会被绑定
                 if let Some(session) = session_id.as_deref() {
                     self.token_manager.bind_session(session, ctx.id);
@@ -894,7 +981,7 @@ impl KiroProvider {
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    budget_used,
                     max_retries,
                     status,
                     body
@@ -949,7 +1036,7 @@ impl KiroProvider {
                     tracing::error!(
                         "API 请求失败（账号被封禁，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
                         ctx.id,
-                        attempt + 1,
+                        budget_used,
                         max_retries,
                         status,
                         body
@@ -983,7 +1070,7 @@ impl KiroProvider {
 
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    budget_used,
                     max_retries,
                     status,
                     body
@@ -1042,7 +1129,7 @@ impl KiroProvider {
                     "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
                     ctx.id,
                     cooldown_secs,
-                    attempt + 1,
+                    budget_used,
                     max_retries,
                     body
                 );
@@ -1074,6 +1161,42 @@ impl KiroProvider {
                     return Err(rate_limit_error.into());
                 }
                 last_error = Some(rate_limit_error.into());
+                continue;
+            }
+
+            // 429 + USER_REQUEST_RATE_EXCEEDED = 账号级突发限流（短窗口，约每秒补一个名额）
+            // 有其它可用凭据就让当前凭据短暂退出调度、立即换号；只有它可用时排队等放行。
+            // 这类重发不占 max_retries，只受 BURST_LIMIT_MAX_WAIT 约束。
+            if status.as_u16() == 429 && endpoint.is_burst_rate_limited(&body) {
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(429),
+                    outcome::TRANSIENT, Some(&body), attempt_start,
+                );
+                let rate_limit =
+                    rate_limit_error.unwrap_or_else(|| UpstreamRateLimitError::new(None));
+                // 上游明确要求等待：交给客户端遵守
+                if !rate_limit.should_retry_locally() {
+                    return Err(rate_limit.into());
+                }
+                let drain = self.burst_pacer.on_limited(ctx.id, Instant::now());
+                let switched = self.token_manager.avoid_briefly_if_alternatives(
+                    ctx.id,
+                    drain,
+                    model.as_deref(),
+                    group,
+                );
+                tracing::warn!(
+                    "API 请求被账号突发限流（凭据 #{}，{}，已排队 {:.1}s）: {}",
+                    ctx.id,
+                    if switched { "换用其它凭据" } else { "排队等待放行" },
+                    burst_waited.as_secs_f32(),
+                    body
+                );
+                last_error = Some(rate_limit.into());
+                if burst_requeues < BURST_LIMIT_MAX_REQUEUES {
+                    burst_requeues += 1;
+                    budget_used -= 1;
+                }
                 continue;
             }
 
@@ -1121,7 +1244,7 @@ impl KiroProvider {
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    budget_used,
                     max_retries,
                     status,
                     body
@@ -1143,7 +1266,7 @@ impl KiroProvider {
                         body
                     ))
                 };
-                if attempt + 1 < max_retries {
+                if budget_used < max_retries {
                     // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
                     let delay = if status.as_u16() == 429 {
                         Self::retry_delay_throttle(attempt)
@@ -1167,7 +1290,7 @@ impl KiroProvider {
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
+                budget_used,
                 max_retries,
                 status,
                 body
@@ -1182,7 +1305,7 @@ impl KiroProvider {
                 status,
                 body
             ));
-            if attempt + 1 < max_retries {
+            if budget_used < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }

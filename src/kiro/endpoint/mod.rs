@@ -70,6 +70,14 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_account_throttled(body)
     }
 
+    /// 判断响应体是否表示"账号级突发限流"（429 + `USER_REQUEST_RATE_EXCEEDED`）
+    ///
+    /// 这是按账号计的短窗口令牌桶，等一两秒就补回名额：应排队重发或换号，
+    /// 不能像 suspicious activity 那样把凭据冷却几十分钟。
+    fn is_burst_rate_limited(&self, body: &str) -> bool {
+        default_is_burst_rate_limited(body)
+    }
+
     /// 判断响应体是否表示"客户端请求格式错误"（messages 数组本身违反协议）
     ///
     /// 这类错误（tool_use↔tool_result 不配对、消息序列非法等）的根因是调用方的
@@ -162,6 +170,25 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 pub fn default_is_account_throttled(body: &str) -> bool {
     body.contains("suspicious activity")
         && body.contains("temporary limits")
+}
+
+/// 默认的"账号级突发限流"判断逻辑
+///
+/// 上游返回 429 + `{"message":"Too many requests, please wait before trying again.",
+/// "reason":"USER_REQUEST_RATE_EXCEEDED"}`。实测同一账号一波并发约十几个请求能直接
+/// 通过，之后大约每秒放行一个。只认结构化 reason（顶层或 `error.reason`），
+/// 不按文案猜：同样的文案也出现在其它更长周期的限流里。
+pub fn default_is_burst_rate_limited(body: &str) -> bool {
+    const REASON: &str = "USER_REQUEST_RATE_EXCEEDED";
+    if !body.contains(REASON) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let top = value.get("reason").and_then(|v| v.as_str());
+    let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+    [top, nested].into_iter().flatten().any(|r| r == REASON)
 }
 
 /// 默认的"账号被封禁/停用"判断逻辑
@@ -394,6 +421,32 @@ mod tests {
         ));
         // 仅有一半关键词时也不命中
         assert!(!default_is_account_throttled("suspicious activity detected"));
+    }
+
+    #[test]
+    fn test_default_is_burst_rate_limited() {
+        // 实测报文
+        assert!(default_is_burst_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(default_is_burst_rate_limited(
+            r#"{"error":{"reason":"USER_REQUEST_RATE_EXCEEDED"}}"#
+        ));
+        // 其它限流 / 容量类 429 不按突发限流处理
+        assert!(!default_is_burst_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":"CREDIT_CONSUMPTION_RATE_EXCEEDED"}"#
+        ));
+        assert!(!default_is_burst_rate_limited(
+            r#"{"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
+        ));
+        assert!(!default_is_burst_rate_limited(
+            r#"{"message":"Too many requests, please wait before trying again.","reason":null}"#
+        ));
+        // reason 关键词只出现在 message 里不算
+        assert!(!default_is_burst_rate_limited(
+            r#"{"message":"saw USER_REQUEST_RATE_EXCEEDED earlier","reason":"OTHER"}"#
+        ));
+        assert!(!default_is_burst_rate_limited("USER_REQUEST_RATE_EXCEEDED"));
     }
 
     #[test]

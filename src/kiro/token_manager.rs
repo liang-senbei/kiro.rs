@@ -3317,6 +3317,36 @@ impl MultiTokenManager {
         }
     }
 
+    /// 账号级突发限流时，若当前请求范围内还有其它可用凭据，就让 `id` 短暂退出调度
+    /// （冷却 `duration`，不计失败），返回是否这样做了。
+    ///
+    /// 只剩这一个凭据时不冷却：冷却会让它在这段时间里对所有请求都不可用，
+    /// 调用方应改为排队等它放行。
+    pub fn avoid_briefly_if_alternatives(
+        &self,
+        id: u64,
+        duration: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> bool {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let has_alternative = entries
+            .iter()
+            .any(|e| e.id != id && self.entry_available_for_request(e, model, group, now));
+        if !has_alternative {
+            return false;
+        }
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let until = now + duration;
+            entry.throttled_until = Some(match entry.throttled_until {
+                Some(prev) if prev > until => prev,
+                _ => until,
+            });
+        }
+        true
+    }
+
     /// 手动解除指定凭据的临时冷却（Admin API）
     ///
     /// 即使冷却尚未到期也立即清除，让该凭据重新参与调度。
@@ -7489,6 +7519,51 @@ mod tests {
             Some(2)
         );
         assert_eq!(manager.snapshot().available, 1);
+    }
+
+    #[test]
+    fn test_avoid_briefly_only_when_another_credential_can_serve() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g1"]),
+                grouped_cred("c", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let brief = StdDuration::from_secs(5);
+
+        // g1 里 #1 被突发限流：#2 可接手，#1 短暂退出调度，请求改走 #2
+        assert!(manager.avoid_briefly_if_alternatives(1, brief, None, Some("g1")));
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id),
+            Some(2)
+        );
+
+        // #2 随后也被限流：#1 还在冷却、g2 的 #3 不属于本请求范围，不能再冷却 #2，
+        // 否则 g1 整组在这几秒里都无号可用（调用方改为排队）
+        assert!(!manager.avoid_briefly_if_alternatives(2, brief, None, Some("g1")));
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id),
+            Some(2)
+        );
+
+        // 单凭据分组：从不冷却
+        assert!(!manager.avoid_briefly_if_alternatives(3, brief, None, Some("g2")));
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g2"))
+                .map(|(id, _)| id),
+            Some(3)
+        );
     }
 
     #[test]
