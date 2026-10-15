@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+主题：**多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复**。
+
+### 🚦 账号突发限流（`USER_REQUEST_RATE_EXCEEDED`）
+
+- 同一凭据被多个客户端并发使用时，上游按账号限速：一波并发约十几个能直接通过，之后每 1～3 秒才放行一个。以前被拒的请求各自退避 1s / 2s 后几乎同时重发，约 4 秒、3 次尝试后整批返回 429 `Upstream rate limit exceeded`。
+- 新增按凭据的排队放行（`src/kiro/burst_pacer.rs`）：凭据刚被突发限流时，发往它的请求按到达顺序逐个放行，间隔从 1s 起随再次被拒放大、随成功缩小，10 秒无新限流且队列排空后恢复不排队。
+- 这类排队不占普通重试次数，单个请求最多排队 60 秒；超过上限才返回 429，并带上 `Retry-After`。
+- 有其它可用凭据时，被限流的凭据只短暂退出调度（按队列排空时间，通常数秒，不计失败），请求立即换号；只剩它一个时不冷却，改为排队。
+- 不采用 upstream 981aa7a 把该 reason 冷却 30 分钟的做法：实测名额数秒即恢复，单凭据 / 少量凭据部署会因此整段时间不可用。
+
+### 🧭 错误映射
+
+- 上游以 4xx（非 429）拒绝请求（如 `400 Improperly formed request`）时，客户端收到 400（413 保持为 `request_too_large`），而不是 502。以前的 502 会让 Claude Code / SDK 原样重试多次并显示为上游故障。原始报文只进日志，不回显。
+
+### 🧩 工具调用与流式输出
+
+- 无参工具（`input_schema` 无属性）不再以 `upstream_tool_json_error: ... buffered 0 bytes` 结束（流式报错、非流式 502）：按 `{}` 还原，并和普通工具调用一样等 meteringEvent 确认后发出。移植自 upstream 93459b5，并接入本 fork 的扣住 / 截断重试逻辑。
+- 正文出现孤立的 `<`（如 `a < b`）后，后续正文不再被扣到流结束才一次性吐出：只保留还可能是 `<invoke` / `<prefix:invoke` 开标签前缀的尾巴（最多 64 字节）。
+- `/cc/v1/messages` 缓冲流读上游响应体失败时，不再把半截回答以 `end_turn` + `message_stop` 正常收尾，改为只发 `overloaded_error` 事件，客户端按临时故障整轮重试。
+
+### ⬆️ 从 upstream 移植
+
+- c38ca44 / f1e67e6：balanced 模式粘性未命中时在可用凭据中随机选号（以前按成功次数取最小，并发请求会一起压到同一个凭据，持续失败的凭据还会困住所有请求）。
+- 4f1dd58 / 1a9e786：所有 SSE 响应加 `x-accel-buffering: no`，前置 nginx 不再缓冲流式输出。
+- 74095ef：历史中带 `pages` 的 `Read` 调用不再让会话之后每一轮都失败。
+- 4640216 / dee54de：Claude Opus 5.5 与 gpt-5.6 系列按 1M 上下文窗口换算 `input_tokens`（以前分别按 200K / 272K，少报导致客户端压缩上下文过晚）。
+
 ## [0.9.0] - 2026-09-17
 
 主题：**控制台主题与表格体验、Prompt Cache 计量与会话粘性路由、Codex 远程上下文压缩，以及凭据区域兼容性修复**。本版汇总 `v0.8.0` 之后的变更；新增配置提供默认值，请求日志数据库在启动时自动补齐新增字段。
