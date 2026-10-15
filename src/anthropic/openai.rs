@@ -157,6 +157,7 @@ pub async fn post_chat_completions(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
             .body(Body::from(sse))
             .unwrap()
     } else {

@@ -1029,10 +1029,14 @@ async fn handle_stream_request(
     );
 
     // 返回 SSE 响应
+    // `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
+    // 若反代开启了响应缓冲，SSE 分片会先攒在缓冲区再转发，拉长增量到达延迟；
+    // 该头只作用于当前响应，无需在反代侧改全局配置。
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
@@ -2534,6 +2538,7 @@ async fn handle_stream_request_buffered(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
@@ -4000,5 +4005,50 @@ mod tests {
         let mut no_effort = effort_request("max");
         no_effort.output_config = None;
         assert!(RetryEffortDowngrade::new(no_effort, ToolCompatibilityMode::Raw).is_none());
+    }
+
+    /// 每个 SSE 响应都要带 `x-accel-buffering: no`。
+    ///
+    /// 走源码扫描而非构造响应：SSE 端点散落在 7 个模块且构造成本高，而风险点
+    /// 恰是"新增端点时忘了带"。
+    #[test]
+    fn every_sse_response_disables_proxy_buffering() {
+        const SSE_CONTENT_TYPE: &str = r#".header(header::CONTENT_TYPE, "text/event-stream")"#;
+        const NO_BUFFERING: &str = r#".header("x-accel-buffering", "no")"#;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0;
+        let mut missing = Vec::new();
+
+        let mut stack = vec![root];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).expect("read src dir") {
+                let entry = entry.expect("dir entry");
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&p).expect("read rs file");
+                for (idx, _) in src.match_indices(SSE_CONTENT_TYPE) {
+                    checked += 1;
+                    // 头部块紧邻 content-type；按字符截取，避免切断中文注释的 UTF-8 编码。
+                    let tail: String = src[idx..].chars().take(400).collect();
+                    if !tail.contains(NO_BUFFERING) {
+                        let line = src[..idx].lines().count();
+                        missing.push(format!("{}:{}", p.display(), line));
+                    }
+                }
+            }
+        }
+
+        assert!(checked > 0, "未扫描到任何 SSE 响应，断言失效");
+        assert!(
+            missing.is_empty(),
+            "以下 SSE 响应缺少 `x-accel-buffering: no`：{missing:?}"
+        );
     }
 }

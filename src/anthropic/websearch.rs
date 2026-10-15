@@ -543,6 +543,7 @@ fn render_websearch_response(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
             .header(header::CONNECTION, "keep-alive")
             .body(Body::from_stream(stream))
             .unwrap()

@@ -531,8 +531,9 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 上下文窗口估算：
 
-- `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
+- `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`：`1_000_000`（静态模型声明最大输出为 `64_000`）
+- 其它 `gpt-5.*`：`272_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 ### 自定义模型

@@ -296,7 +296,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
+/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 同 1M
 ///
 /// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
 /// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
@@ -311,7 +311,16 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 
     match map_model(model) {
-        // GPT-5.6 family on Kiro ships a 272K context window.
+        // Kiro exposes the GPT-5.6 family with a 1M context window.
+        Some(mapped)
+            if matches!(
+                mapped.as_str(),
+                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+            ) =>
+        {
+            1_000_000
+        }
+        // Keep the existing fallback for other GPT models until their limits are confirmed.
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
@@ -321,6 +330,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-opus-5"
+                || mapped == "claude-opus-5.5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -602,7 +612,7 @@ pub enum ConversionError {
     InvalidModel(String),
     EmptyMessages,
     InvalidMessageSequence(String),
-    /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
+    /// Claude Code 工具无法映射到 Kiro 内置工具（如内置缺 schema）。
     UnsupportedToolMapping(String),
 }
 
@@ -1376,11 +1386,9 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         ("Read", "read_file") => {
-            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
-                return Err(ConversionError::UnsupportedToolMapping(
-                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
-                ));
-            }
+            // Claude Code 的 `pages`（PDF 页范围）在 Kiro read_file 中无对应字段。本函数只处理
+            // 回放的历史 tool_use，客户端无法修正，拒绝会让整个会话永久 400；这里随白名单
+            // 构造自然丢弃，Kiro 看到的只是一次普通读取历史。
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
             let limit = obj.get("limit").and_then(optional_number);
@@ -2188,6 +2196,20 @@ mod tests {
             map_model("claude-sonnet-5-2"),
             Some("claude-sonnet-5.2".to_string())
         );
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5-latest",
+            "claude-opus-5-5-20270101",
+            "CLAUDE-OPUS-5-5",
+        ] {
+            assert_eq!(
+                map_model(model),
+                Some("claude-opus-5.5".to_string()),
+                "{model} 应映射到 claude-opus-5.5"
+            );
+        }
         assert_eq!(
             map_model("claude-opus-5-beta"),
             Some("claude-opus-5-beta".to_string())
@@ -2223,6 +2245,8 @@ mod tests {
             "claude-opus-4-7",
             "claude-opus-4-8",
             "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-opus-5.5-thinking",
             "claude-fable-5",
         ] {
             assert_eq!(
@@ -2252,10 +2276,17 @@ mod tests {
     #[test]
     fn test_map_model_gpt_5_6_family() {
         // Kiro serves the GPT-5.6 family; ids pass through verbatim.
-        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
-        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
-        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
-        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(map_model(model), Some(model.to_string()));
+            assert_eq!(
+                get_context_window_size(model),
+                1_000_000,
+                "{model} should use the 1M context window"
+            );
+        }
+
+        // Do not silently expand unconfirmed GPT model windows.
+        assert_eq!(get_context_window_size("gpt-5.5"), 272_000);
     }
 
     #[test]
@@ -2372,6 +2403,26 @@ mod tests {
                 .model_id,
             "glm-5"
         );
+    }
+
+    #[test]
+    fn test_opus_5_5_maps_upstream_id_and_keeps_xhigh() {
+        let req =
+            minimal_adaptive_thinking_request_with_effort("claude-opus-5-5-thinking", "xhigh");
+        let result = convert_request(&req).unwrap();
+
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-opus-5.5"
+        );
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 5.5 adaptive thinking should keep output_config");
+        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
     }
 
     #[test]
@@ -2560,6 +2611,7 @@ mod tests {
             "claude-sonnet-4.6",
             "claude-fable-5",
             "claude-sonnet-5",
+            "claude-opus-5.5",
         ] {
             assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
         }
@@ -2922,14 +2974,52 @@ mod tests {
     }
 
     #[test]
-    fn cc_outbound_read_pages_errors() {
-        let err = map_tool_input_to_kiro(
+    fn cc_outbound_read_pages_is_dropped() {
+        let out = map_tool_input_to_kiro(
             "Read",
-            serde_json::json!({"file_path": "/a", "pages": "1-3"}),
+            serde_json::json!({"file_path": "/a", "offset": 3, "pages": "1-3"}),
             ToolCompatibilityMode::ClaudeCode,
         )
-        .unwrap_err();
-        assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
+        .unwrap();
+        assert!(out.get("pages").is_none());
+        assert_eq!(out["path"], serde_json::json!("/a"));
+        assert_eq!(out["start_line"], serde_json::json!(3));
+    }
+
+    /// 回归：历史 assistant 消息里的 Read.pages（含空串）不应让整个请求 400。
+    /// 该入参只会出现在回放历史中，客户端无法修正，报错会让该会话此后每次请求都失败。
+    #[test]
+    fn cc_history_read_with_pages_converts_without_error() {
+        use super::super::types::Message as AnthropicMessage;
+
+        for pages in [serde_json::json!("1-3"), serde_json::json!("")] {
+            let msg = AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "toolu_01PDF", "name": "Read",
+                     "input": {"file_path": "/a.pdf", "pages": pages}}
+                ]),
+            };
+            let mut map = HashMap::new();
+            let result = convert_assistant_message(
+                &msg,
+                &mut map,
+                ToolCompatibilityMode::ClaudeCode,
+                ConversionPurpose::Generate,
+            )
+            .unwrap_or_else(|e| panic!("pages={pages} 的历史 Read 应能转换: {e}"));
+
+            let tool_uses = result
+                .assistant_response_message
+                .tool_uses
+                .expect("应保留 tool_use");
+            assert_eq!(tool_uses[0].name, "read_file");
+            assert_eq!(tool_uses[0].input["path"], serde_json::json!("/a.pdf"));
+            assert!(
+                tool_uses[0].input.get("pages").is_none(),
+                "Kiro read_file schema 为 additionalProperties:false，不能带 pages"
+            );
+        }
     }
 
     #[test]

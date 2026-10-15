@@ -1964,7 +1964,10 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：在可用凭据中均匀随机选择一个
+    ///
+    /// 会话粘性由调用方在此之前处理（见 [`Self::sticky_candidate`]），这里只负责
+    /// 粘性未命中 / 无会话时的选号。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -1976,16 +1979,10 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let now = Instant::now();
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        // 过滤可用凭据（已排除模型缓存明确不支持的凭据）
+        let available: Vec<&CredentialEntry> = entries
             .iter()
-            .filter_map(|e| {
-                if !self.entry_available_for_request(e, model, group, now) {
-                    return None;
-                }
-                let model_support = self.cached_model_support(e.id, model);
-                Some((e, model_support))
-            })
+            .filter(|e| self.entry_available_for_request(e, model, group, now))
             .collect();
 
         if available.is_empty() {
@@ -1995,31 +1992,26 @@ impl MultiTokenManager {
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
-        match mode {
+        let entry = match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let (entry, _) = available.iter().min_by_key(|(e, support)| {
-                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
-                    (
-                        discovery_rank,
-                        e.success_count,
-                        e.credentials.priority,
-                        e.id,
-                    )
-                })?;
-
-                Some((entry.id, entry.credentials.clone()))
+                // 均匀随机，不按历史 success_count / 模型缓存状态排序：
+                // - 按 success_count 取最小会让新加入的凭据（计数为 0）独占流量，
+                //   直到追平老凭据的累计值；
+                // - 优先模型缓存 Confirmed 会让缓存为 Unknown 的凭据（运行时新增、
+                //   缓存被清空后）在有 Confirmed 凭据可用时永远选不到，缓存也就永远
+                //   不会因为被使用而变成 Confirmed。
+                available[fastrand::usize(..available.len())]
             }
             _ => {
                 // priority 模式（默认）：严格选择数字最小的有效凭据。
                 // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
-                let (entry, _) = available
+                available
                     .iter()
-                    .min_by_key(|(e, _)| (e.credentials.priority, e.id))?;
-                Some((entry.id, entry.credentials.clone()))
+                    .copied()
+                    .min_by_key(|e| (e.credentials.priority, e.id))?
             }
-        }
+        };
+        Some((entry.id, entry.credentials.clone()))
     }
 
     /// 获取 API 调用上下文
@@ -6024,20 +6016,23 @@ mod tests {
             MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
         assert_eq!(manager.snapshot().current_id, 1);
-        manager.report_success(1);
 
-        let (context, is_balanced, _) = manager
-            .acquire_context_impl(None, None, None, false)
-            .await
-            .unwrap();
+        // balanced 随机选号：多次只读选择，其中必然会选到 #2，但 current_id 始终不动
+        let mut picked_other = false;
+        for _ in 0..64 {
+            let (context, is_balanced, _) = manager
+                .acquire_context_impl(None, None, None, false)
+                .await
+                .unwrap();
+            assert!(is_balanced);
+            picked_other |= context.id == 2;
+            assert_eq!(manager.snapshot().current_id, 1);
+        }
+        assert!(picked_other, "64 次随机选号应至少选到一次 #2");
 
-        assert!(is_balanced);
-        assert_eq!(context.id, 2);
-        assert_eq!(manager.snapshot().current_id, 1);
-
+        // 真实业务请求才更新 current_id
         let context = manager.acquire_context(None, None).await.unwrap();
-        assert_eq!(context.id, 2);
-        assert_eq!(manager.snapshot().current_id, 2);
+        assert_eq!(manager.snapshot().current_id, context.id);
     }
 
     #[tokio::test]
@@ -6060,9 +6055,15 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
-        manager.report_success(1);
-        let context = manager.acquire_context(None, None).await.unwrap();
-        assert_eq!(context.id, 2);
+        // balanced 下先让 current_id 落到低优先级的 #2
+        let mut on_second = false;
+        for _ in 0..64 {
+            if manager.acquire_context(None, None).await.unwrap().id == 2 {
+                on_second = true;
+                break;
+            }
+        }
+        assert!(on_second, "64 次随机选号应至少选到一次 #2");
         assert_eq!(manager.snapshot().current_id, 2);
 
         manager
@@ -7508,18 +7509,181 @@ mod tests {
         )
         .unwrap();
 
-        // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
-        manager.report_success(1);
-        manager.report_success(1);
-        let pick = manager.select_next_credential(None, Some("g1"));
+        // g1 内随机：A、B 都会被选到，但绝不会越界选到 g2 的 C
+        let mut g1_picks = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let id = manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id)
+                .unwrap();
+            g1_picks.insert(id);
+        }
         assert_eq!(
-            pick.map(|(id, _)| id),
-            Some(2),
-            "balanced 应在 g1 内选 success_count 最小的 B"
+            g1_picks,
+            std::collections::HashSet::from([1, 2]),
+            "balanced 应在 g1 内随机选择 A、B"
         );
-        // g2 不受 g1 计数影响，仍只会选到 C(id3)
-        let pick_g2 = manager.select_next_credential(None, Some("g2"));
-        assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+        // g2 只有 C(id3)
+        for _ in 0..16 {
+            let pick_g2 = manager.select_next_credential(None, Some("g2"));
+            assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+        }
+    }
+
+    fn balanced_manager(creds: Vec<KiroCredentials>) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    /// 回归：模型缓存为 Unknown 的凭据（运行时新增 / 缓存被清空）在有 Confirmed
+    /// 凭据可用时也必须能被选到。旧实现按 discovery_rank 排序会让它永远饿死。
+    #[test]
+    fn balanced_does_not_starve_unknown_model_cache_credentials() {
+        let manager = balanced_manager(vec![
+            grouped_cred("confirmed-a", &[]),
+            grouped_cred("confirmed-b", &[]),
+            grouped_cred("unknown", &[]),
+        ]);
+        seed_model_cache(&manager, 1, &["deepseek-3.2"]);
+        seed_model_cache(&manager, 2, &["deepseek-3.2"]);
+
+        let picked_unknown = (0..200).any(|_| {
+            manager
+                .select_next_credential(Some("deepseek-3.2"), None)
+                .map(|(id, _)| id)
+                == Some(3)
+        });
+        assert!(picked_unknown, "Unknown 缓存的 #3 不能被 Confirmed 凭据饿死");
+    }
+
+    /// 回归：新凭据（success_count = 0）不能独占流量。旧实现按 success_count 取最小，
+    /// 老凭据累计成功数越多，新凭据独占的时间越长。
+    #[test]
+    fn balanced_new_credential_does_not_monopolize_traffic() {
+        let manager = balanced_manager(vec![
+            grouped_cred("veteran", &[]),
+            grouped_cred("fresh", &[]),
+        ]);
+        for _ in 0..1000 {
+            manager.report_success(1);
+        }
+
+        let mut counts = [0usize; 2];
+        for _ in 0..400 {
+            let id = manager.select_next_credential(None, None).unwrap().0;
+            counts[(id - 1) as usize] += 1;
+        }
+        // 均匀随机下 #1 期望 200 次；低于 100 的概率可忽略
+        assert!(
+            counts[0] >= 100,
+            "success_count 高的老凭据仍应分到流量: {counts:?}"
+        );
+    }
+
+    /// 回归：持续失败但不会被禁用的凭据（无专属代理的网络错误、408/429/5xx 都既不
+    /// 计成功也不计失败），其 success_count 永远最低。旧实现取最小会让每个请求、
+    /// 以及同一请求的每次重试都选中它，健康凭据完全不参与故障转移。
+    #[tokio::test]
+    async fn balanced_failing_credential_does_not_trap_requests_and_retries() {
+        let manager = balanced_manager(vec![
+            grouped_cred("broken-proxy", &[]),
+            grouped_cred("healthy-a", &[]),
+            grouped_cred("healthy-b", &[]),
+        ]);
+        for _ in 0..50 {
+            manager.report_success(2);
+            manager.report_success(3);
+        }
+
+        // 模拟 provider 的重试循环：每次尝试都重新选号；#1 失败时不上报
+        // （与 provider 对无专属代理网络错误 / 瞬态 5xx 的处理一致）。
+        const MAX_ATTEMPTS: usize = 4; // provider::MAX_TOTAL_RETRIES
+        let mut succeeded = 0;
+        for _ in 0..200 {
+            for _ in 0..MAX_ATTEMPTS {
+                let ctx = manager.acquire_context(None, None).await.unwrap();
+                if ctx.id != 1 {
+                    manager.report_success(ctx.id);
+                    succeeded += 1;
+                    break;
+                }
+            }
+        }
+        // 随机下单个请求 4 次都落到 #1 的概率 (1/3)^4 ≈ 1.2%，期望成功约 197 次
+        assert!(
+            succeeded >= 180,
+            "健康凭据应接住绝大多数请求，实际成功 {succeeded}/200"
+        );
+    }
+
+    /// balanced 随机只在可用凭据中选：模型缓存明确不支持、禁用的凭据不会被选到。
+    #[test]
+    fn balanced_random_pick_respects_availability() {
+        let manager = balanced_manager(vec![
+            grouped_cred("unsupported", &[]),
+            grouped_cred("disabled", &[]),
+            grouped_cred("ok-a", &[]),
+            grouped_cred("ok-b", &[]),
+        ]);
+        seed_model_cache(&manager, 1, &["glm-5"]);
+        manager.set_disabled(2, true).unwrap();
+
+        let mut picks = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let id = manager
+                .select_next_credential(Some("deepseek-3.2"), None)
+                .unwrap()
+                .0;
+            picks.insert(id);
+        }
+        assert_eq!(picks, std::collections::HashSet::from([3, 4]));
+    }
+
+    /// balanced + 会话粘性：命中时始终沿用绑定凭据；未命中（首轮 / 绑定不可用）时随机选号。
+    #[tokio::test]
+    async fn balanced_keeps_sticky_binding_and_randomizes_on_miss() {
+        let manager = balanced_manager(vec![
+            grouped_cred("a", &[]),
+            grouped_cred("b", &[]),
+            grouped_cred("c", &[]),
+        ]);
+
+        // 首轮无绑定：随机，三个都可能选到
+        let mut first_picks = std::collections::HashSet::new();
+        for i in 0..200 {
+            let (ctx, route) = manager
+                .acquire_context_routed(None, None, Some(&format!("new-{i}")))
+                .await
+                .unwrap();
+            assert_eq!(route.sticky_outcome, StickyOutcome::MissFirst);
+            first_picks.insert(ctx.id);
+        }
+        assert_eq!(first_picks, std::collections::HashSet::from([1, 2, 3]));
+
+        // 绑定后始终命中同一凭据
+        manager.bind_session("sess", 2);
+        for _ in 0..50 {
+            let (ctx, route) = manager
+                .acquire_context_routed(None, None, Some("sess"))
+                .await
+                .unwrap();
+            assert_eq!(ctx.id, 2);
+            assert_eq!(route.sticky_outcome, StickyOutcome::Hit);
+        }
+
+        // 绑定凭据不可用：在剩余凭据中随机，不会落回 #2
+        manager.set_disabled(2, true).unwrap();
+        let mut fallback_picks = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let (ctx, route) = manager
+                .acquire_context_routed(None, None, Some("sess"))
+                .await
+                .unwrap();
+            assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
+            fallback_picks.insert(ctx.id);
+        }
+        assert_eq!(fallback_picks, std::collections::HashSet::from([1, 3]));
     }
 
     #[tokio::test]
