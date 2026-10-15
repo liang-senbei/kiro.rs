@@ -232,7 +232,7 @@ export function ClientKeyExportDialog({
                 客户端访问本服务的地址，默认取当前页面地址；经反向代理或域名对外提供时，填对外地址。
                 {endpointMode === 'standard'
                   ? ' 标准端点实时流式输出，上游中途收尾时会透明重试。'
-                  : ' /cc 端点按 Claude Code 调整事件顺序：整段缓冲后一次性输出，开头的用量更准。'}
+                  : ' /cc 端点现在和标准端点走同一条实时流，保留给已经按 /cc 配置的客户端；开头事件里的用量是估算值，结束时更正。'}
               </p>
               {!baseUrlValid && <p className="text-destructive">地址需要以 http:// 或 https:// 开头。</p>}
               {local && (
