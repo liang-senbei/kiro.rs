@@ -978,6 +978,20 @@ pub struct CreateClientKeyResponse {
     pub created_at: String,
 }
 
+/// 导出客户端 Key 响应：供 Admin UI 生成「直接使用」配置与 CC Switch 导入链接。
+///
+/// 含明文 Key，只经 POST 返回且带 `Cache-Control: no-store`。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportClientKeyResponse {
+    pub id: u64,
+    pub key: String,
+    pub name: String,
+    pub disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
 /// 更新客户端 Key 元数据
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

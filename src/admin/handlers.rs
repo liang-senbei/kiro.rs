@@ -22,7 +22,7 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, ModelTestRequest,
+        CreateClientKeyResponse, ExportClientKeyResponse, ModelTestRequest,
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
@@ -1185,9 +1185,44 @@ pub async fn reset_client_key_stats(
     }
 }
 
+/// POST /api/admin/client-keys/:id/export
+///
+/// 返回该 Key 的明文，供 Admin UI 生成「直接使用」配置和 CC Switch 导入链接。
+/// 用 POST 并带 `Cache-Control: no-store`，避免浏览器预取、缓存或进访问日志。
+pub async fn export_client_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> Response {
+    export_client_key_response(id, state.client_keys.get(id))
+}
+
+fn export_client_key_response(id: u64, entry: Option<super::client_keys::ClientKey>) -> Response {
+    match entry {
+        Some(entry) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(ExportClientKeyResponse {
+                id: entry.id,
+                key: entry.key,
+                name: entry.name,
+                disabled: entry.disabled,
+                group: entry.group,
+            }),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /api/admin/client-keys/:id/rotate
 ///
-/// 轮换 Key 值：旧明文立即失效，生成新明文返回（仅此一次可见）。
+/// 轮换 Key 值：旧明文立即失效，生成新明文返回（之后可经 export 再次取回）。
 /// 保留 id/name/description/group/统计/disabled 不变，无需重新分组绑定。
 pub async fn rotate_client_key(
     State(state): State<AdminState>,
@@ -1848,4 +1883,33 @@ pub async fn delete_group(
         name
     )))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn export_client_key_returns_plaintext_without_caching() {
+        let keys = super::super::client_keys::ClientKeyManager::new();
+        let entry = keys.create("team-a".to_string(), None, Some("g1".to_string()));
+
+        let resp = export_client_key_response(entry.id, keys.get(entry.id));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["key"], entry.key);
+        assert_eq!(body["name"], "team-a");
+        assert_eq!(body["group"], "g1");
+        assert_eq!(body["disabled"], false);
+    }
+
+    #[test]
+    fn export_missing_client_key_is_404() {
+        let resp = export_client_key_response(42, None);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
