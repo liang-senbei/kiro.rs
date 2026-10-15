@@ -706,16 +706,30 @@ fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
 
 /// 计算缓冲区末尾“可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
 ///
-/// 例如缓冲区以 `<inv` / `<` / `<i` 结尾时，可能是被切碎的 invoke 开标签，
+/// 例如缓冲区以 `<inv` / `<` / `<i` / `<ns:inv` 结尾时，可能是被切碎的 invoke 开标签，
 /// 保留这段尾巴等下一个 chunk 拼齐，避免把半个标签当文本吐出去。
+///
+/// 只保留还能长成 `<invoke` / `<prefix:invoke` 的尾巴：`<` 之后只有标识符字符，
+/// 至多一个 `:` 且其后是 `invoke` 的前缀。正文里的 `a < b`、`x<y then` 不保留——
+/// 以前只看 `<` 之后有没有 `>`，正文出现孤立的 `<` 后整段后续正文都会被扣到流结束。
 fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
-    // 任何形如 `<...`（最后一个 '<' 之后没有 '>'）的尾巴都可能是部分开标签
-    if let Some(lt) = buf.rfind('<') {
-        if !buf[lt..].contains('>') {
-            return buf.len() - lt;
-        }
+    /// 超过这个长度的尾巴不可能还是半个开标签
+    const MAX_PARTIAL_TAG_BYTES: usize = 64;
+
+    let Some(lt) = buf.rfind('<') else {
+        return 0;
+    };
+    let tail = &buf[lt + 1..];
+    if tail.len() > MAX_PARTIAL_TAG_BYTES {
+        return 0;
     }
-    0
+    let is_ident = |s: &str| s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+    let could_be_open_tag = match tail.split_once(':') {
+        // `<`、`<inv`，或者还在写命名空间前缀的 `<ns`
+        None => is_ident(tail),
+        Some((prefix, name)) => !prefix.is_empty() && is_ident(prefix) && "invoke".starts_with(name),
+    };
+    if could_be_open_tag { buf.len() - lt } else { 0 }
 }
 
 /// 从完整文本中提取 thinking 块（用于非流式响应）
@@ -1031,8 +1045,39 @@ impl ToolJsonAccumulator {
         )))
     }
 
+    /// 流结束时取出无参工具的滞留缓冲，按 `{}` 还原成完整工具调用（按 tool_use_id 排序）。
+    ///
+    /// 无参工具（`input_schema` 无属性）只会收到一条 `toolUseEvent`：`input` 为空、
+    /// `stop` 缺省为 false。没有后续参数分片，上游也不会再补 `stop=true`，缓冲因此
+    /// 滞留且为 0 字节。这不是截断，与 `push` 收到 `stop=true` 时对空 `input` 的处理一致。
+    ///
+    /// 同时还有累积了非空内容却从未 `stop` 的缓冲（上游在参数中途截断）时一个也不取：
+    /// 截断优先，整条响应交给 [`Self::finish`] 报错，不能只捞回无参调用就当成功。
+    pub fn take_noarg_pending(
+        &mut self,
+        tool_name_map: &HashMap<String, String>,
+    ) -> Vec<CompletedToolUse> {
+        if self
+            .buffers
+            .values()
+            .any(|(_, input)| !input.trim().is_empty())
+        {
+            return Vec::new();
+        }
+        // HashMap 迭代序不稳定；排序保证多个无参调用同时滞留时内容块顺序可复现。
+        let mut recovered: Vec<_> = std::mem::take(&mut self.buffers).into_iter().collect();
+        recovered.sort_by(|(a, _), (b, _)| a.cmp(b));
+        recovered
+            .into_iter()
+            .map(|(tool_use_id, (kiro_name, _))| {
+                CompletedToolUse::from_kiro(tool_use_id, &kiro_name, json!({}), tool_name_map)
+            })
+            .collect()
+    }
+
     /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
     /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
+    /// 无参工具的 0 字节缓冲须先由 [`Self::take_noarg_pending`] 取走。
     pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
         if let Some((tool_use_id, (name, input))) = self
             .buffers
@@ -2728,6 +2773,21 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = self.flush_pending_buffers();
 
+        // 无参工具（0 字节滞留、上游不会补 stop=true）在此按 `{}` 还原，与普通工具调用
+        // 一样：本次尝试已有 meteringEvent 就发出，否则扣住，交给下面的截断判定。
+        if self.tool_json_error.is_none() {
+            for completed in self
+                .tool_json_accumulator
+                .take_noarg_pending(&self.tool_name_map)
+            {
+                if self.attempt_metered {
+                    events.extend(self.emit_completed_tool_use(completed));
+                } else {
+                    self.held_tool_uses.push(completed);
+                }
+            }
+        }
+
         // 上游中途收尾（只有 thinking / 工具调用后没有 meteringEvent，credits=0）：
         // 以前只有 thinking 时伪造 stop_reason=max_tokens 并补一个空格正文，Claude Code 会据此报
         // 「Output token limit hit」并自动续写，续写又带着这条空回合进历史，连环失败；
@@ -2894,6 +2954,26 @@ impl BufferedStreamContext {
         std::mem::take(&mut self.event_buffer)
     }
 
+    /// 读上游响应体失败时的异常终态：丢弃全部缓冲，只返回一个 `error` 事件（不发 message_stop）。
+    ///
+    /// 缓冲模式下客户端此前只收到过 ping，缓冲里的内容可能是半截的。若走
+    /// [`Self::finish_and_get_all_events`]，半截回答会以 `end_turn` + message_stop 正常收尾，
+    /// 客户端把截断的回答当成完整回答写进历史。
+    pub fn abort_with_error(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        self.event_buffer.clear();
+        self.initial_events_generated = true;
+        vec![SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message
+                }
+            }),
+        )]
+    }
+
     /// 取出最终用量（在 finish_and_get_all_events 之后调用）
     ///
     /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
@@ -3026,6 +3106,49 @@ mod tests {
     }
 
     #[test]
+    fn partial_invoke_suffix_only_holds_possible_open_tags() {
+        // 可能是被切碎的开标签：保留
+        assert_eq!(partial_invoke_tag_suffix_len("text <"), 1);
+        assert_eq!(partial_invoke_tag_suffix_len("text <inv"), 4);
+        assert_eq!(partial_invoke_tag_suffix_len("text <ns"), 3);
+        assert_eq!(partial_invoke_tag_suffix_len("text <ns:"), 4);
+        assert_eq!(partial_invoke_tag_suffix_len("text <ns:inv"), 7);
+        // 正文里的比较符号：不保留
+        assert_eq!(partial_invoke_tag_suffix_len("if a < b then"), 0);
+        assert_eq!(partial_invoke_tag_suffix_len("x<y then more text"), 0);
+        assert_eq!(partial_invoke_tag_suffix_len("延迟 < 100ms，后面还有"), 0);
+        assert_eq!(partial_invoke_tag_suffix_len("<ns:other"), 0);
+        assert_eq!(partial_invoke_tag_suffix_len("<a:b:invoke"), 0);
+        assert_eq!(partial_invoke_tag_suffix_len("closed <b>"), 0);
+        assert_eq!(partial_invoke_tag_suffix_len(&format!("<{}", "x".repeat(65))), 0);
+        assert_eq!(partial_invoke_tag_suffix_len("no tags"), 0);
+    }
+
+    /// 正文出现孤立的 `<` 后，后续正文必须继续实时发出，不能被扣到流结束。
+    #[test]
+    fn stray_less_than_does_not_hold_back_following_text() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut streamed = String::new();
+        for chunk in ["if a < b then", " the rest arrives", " and keeps going."] {
+            for event in ctx.process_kiro_event(&text_evt(chunk)) {
+                if event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == json!("text_delta")
+                {
+                    streamed.push_str(event.data["delta"]["text"].as_str().unwrap());
+                }
+            }
+        }
+        assert_eq!(streamed, "if a < b then the rest arrives and keeps going.");
+    }
+
+    #[test]
     fn tool_json_accumulator_incomplete_on_missing_stop() {
         let mut acc = ToolJsonAccumulator::new();
         // 只来了半截、从未 stop → finish() 报 IncompleteJson。
@@ -3044,6 +3167,130 @@ mod tests {
         ));
         // 已取出残留后再 finish() 应成功。
         assert!(acc.finish().is_ok());
+    }
+
+    /// 无参工具：上游只发一条 `input` 为空、`stop` 缺省为 false 的事件，之后没有分片。
+    /// 必须还原为 `{}`，而不是报 `buffered 0 bytes`。
+    #[test]
+    fn tool_json_accumulator_recovers_noarg_tool_on_missing_stop() {
+        let mut acc = ToolJsonAccumulator::new();
+        assert!(
+            acc.push(
+                &tool_evt("t1", "mcp__computer-use__list_apps", "", false),
+                &HashMap::new()
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let recovered = acc.take_noarg_pending(&HashMap::new());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, "t1");
+        assert_eq!(recovered[0].name, "mcp__computer-use__list_apps");
+        assert_eq!(recovered[0].input, json!({}));
+        assert!(acc.finish().is_ok());
+    }
+
+    /// 无参调用与真正的半截调用同时滞留：截断优先，一个也不捞回，整条响应报错。
+    #[test]
+    fn tool_json_accumulator_truncation_wins_over_noarg_recovery() {
+        let mut acc = ToolJsonAccumulator::new();
+        let _ = acc.push(&tool_evt("empty", "list_apps", "", false), &HashMap::new());
+        let _ = acc.push(
+            &tool_evt("half", "read_file", "{\"path\":\"/a", false),
+            &HashMap::new(),
+        );
+
+        assert!(acc.take_noarg_pending(&HashMap::new()).is_empty());
+        match acc.finish().unwrap_err() {
+            ToolJsonAccumulatorError::IncompleteJson {
+                tool_use_id, bytes, ..
+            } => {
+                assert_eq!(tool_use_id, "half");
+                assert_eq!(bytes, "{\"path\":\"/a".len());
+            }
+            other => panic!("expected IncompleteJson, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_json_accumulator_recovers_all_noarg_tools_in_stable_order() {
+        let mut acc = ToolJsonAccumulator::new();
+        for id in ["t3", "t1", "t2"] {
+            let _ = acc.push(&tool_evt(id, "list_apps", "", false), &HashMap::new());
+        }
+        let ids: Vec<String> = acc
+            .take_noarg_pending(&HashMap::new())
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, ["t1", "t2", "t3"]);
+    }
+
+    /// 端到端：有 meteringEvent 时，无参工具以正常终态（tool_use + message_stop）结束，没有 error 事件。
+    #[test]
+    fn noarg_tool_without_stop_ends_stream_normally_when_metered() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let emitted =
+            ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "", false)));
+        assert!(emitted.is_empty(), "无参调用在收到 stop 前仍应缓冲");
+        let _ = ctx.process_kiro_event(&metering_evt());
+
+        let final_events = ctx.generate_final_events();
+        assert!(
+            !final_events.iter().any(|e| e.event == "error"),
+            "无参工具不应产生 error 事件: {:?}",
+            final_events.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+        let start = final_events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .expect("应发出 tool_use 内容块");
+        assert_eq!(start.data["content_block"]["type"], json!("tool_use"));
+        assert_eq!(start.data["content_block"]["name"], json!("list_apps"));
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "content_block_delta")
+            .expect("应发出参数 JSON");
+        assert_eq!(delta.data["delta"]["partial_json"], json!("{}"));
+        assert_eq!(final_events.last().unwrap().event, "message_stop");
+        let stop_reason = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["delta"]["stop_reason"].clone());
+        assert_eq!(stop_reason, Some(json!("tool_use")));
+    }
+
+    /// 没有 meteringEvent 时，还原出的无参工具与普通工具调用一样被扣住，按中途收尾处理（可透明重试）。
+    #[test]
+    fn noarg_tool_without_metering_is_held_as_truncation() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "", false)));
+
+        let final_events = ctx.generate_final_events();
+        assert!(ctx.truncation_error().is_some());
+        assert!(ctx.tool_json_error_message().is_none(), "不应再报 buffered 0 bytes");
+        assert!(
+            !final_events
+                .iter()
+                .any(|e| e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == json!("tool_use")),
+            "未确认的工具调用不能发给客户端"
+        );
     }
 
     #[test]
@@ -6123,5 +6370,30 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+    }
+
+    /// 缓冲流读 body 失败：半截回答不能以 message_stop 正常收尾，只发 error 终态。
+    #[test]
+    fn buffered_stream_read_failure_sends_only_an_error_event() {
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.process_and_buffer(&text_evt("答案的前半段，后面还没"));
+
+        let events =
+            ctx.abort_with_error(TRUNCATION_ERROR_TYPE, "Upstream response stream was interrupted");
+        assert_eq!(
+            events.len(),
+            1,
+            "{:?}",
+            events.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data["error"]["type"], json!(TRUNCATION_ERROR_TYPE));
+        assert!(ctx.finish_and_get_all_events().iter().all(|e| e.event != "message_start"));
     }
 }

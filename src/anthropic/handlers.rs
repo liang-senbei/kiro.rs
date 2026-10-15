@@ -1820,13 +1820,19 @@ fn parse_non_stream_attempt(
         }
     }
 
-    // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
-    // finish() 返回 IncompleteJson。已有错误则保持不变。
-    if tool_json_error.is_none()
-        && let Err(e) = tool_accumulator.finish()
-    {
-        tracing::error!("{}", e);
-        tool_json_error = Some(e);
+    // 收尾：无参工具（0 字节滞留、上游不会补 stop=true）按 {} 还原补进 content，
+    // 与普通工具调用一样受 meteringEvent 确认约束；累积了非空内容却从未收到
+    // stop=true 的（上游在参数写到一半时截断）由 finish() 返回 IncompleteJson。
+    // 已有错误则保持不变。
+    if tool_json_error.is_none() {
+        for completed in tool_accumulator.take_noarg_pending(tool_name_map) {
+            tool_uses.push(completed.to_anthropic_block());
+            tools_unconfirmed = metering.is_none();
+        }
+        if let Err(e) = tool_accumulator.finish() {
+            tracing::error!("{}", e);
+            tool_json_error = Some(e);
+        }
     }
 
     // 确定 stop_reason（上游显式给出的 max_tokens / 上下文满是真实终态，不按中途收尾处理）
@@ -2640,8 +2646,13 @@ fn create_buffered_sse_stream(
                             Some(Err(e)) => {
                                 let cause = error_chain(&e);
                                 tracing::error!("读取上游响应流失败: {}", cause);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
+                                // 客户端只收到过 ping：丢弃可能半截的缓冲，只发 error 终态，
+                                // 不能以 message_stop 把截断的回答当成完整回答交出去。
+                                // overloaded_error 让客户端当成临时故障整轮重试。
+                                let all_events = ctx.abort_with_error(
+                                    super::stream::TRUNCATION_ERROR_TYPE,
+                                    "Upstream response stream was interrupted",
+                                );
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流
