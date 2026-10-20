@@ -28,8 +28,9 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
+use crate::kiro::model::available_models::UpstreamModel;
 use crate::kiro::token_manager::{
-    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+    IdcReloginCredentials, ModelDiscoveryError, MultiTokenManager, RefreshTokenInvalidError,
 };
 use crate::model::config::Config;
 
@@ -1136,6 +1137,14 @@ impl AdminService {
             ModelSelectionMode::Priority
         };
         Ok(available_models_response(id, selection_mode, response))
+    }
+
+    /// 某个客户端 Key 分组能用的模型（上游列表并集 + 自定义模型），与 `/v1/models` 一致。
+    pub async fn models_for_group(
+        &self,
+        group: Option<&str>,
+    ) -> Result<Vec<UpstreamModel>, ModelDiscoveryError> {
+        self.token_manager.discover_models_for_group(group).await
     }
 
     /// 对指定模型发送真实、最小化的 Kiro 请求。

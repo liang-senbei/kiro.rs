@@ -322,6 +322,7 @@ codex
 | `/api/admin/models/test` | 对指定模型发送真实的最小化请求并返回响应、耗时和 credit |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
 | `/api/admin/client-keys/{id}/export` | 取回明文 Key 用于导出配置（POST，`no-store`） |
+| `/api/admin/client-keys/{id}/models` | 这把 Key 所在分组能用的模型（同 `/v1/models` 格式），供导出时选模型 |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
@@ -820,11 +821,15 @@ JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退
 
 - **服务地址**：客户端访问本服务的地址，默认取当前页面地址。经反向代理或域名对外提供时改成对外地址，浏览器会记住它。本机 / 内网地址会有提示。
 - **端点**：标准端点（推荐，实时流式，上游中途收尾时透明重试），或 `/cc` 兼容端点。
+- **模型（可选）**：主模型、Opus、Sonnet、Haiku 四个槽位，选项是这把 Key 所在分组能用的模型（同 `/v1/models`，由 `GET /api/admin/client-keys/{id}/models` 以 Admin 身份查询，不计入这把 Key 的调用；查不到时退回账号池当前凭据的模型列表）。不选就用 Claude Code 自带的模型。选了的会按[Claude Code 自己的压缩窗口](#claude-code-自己的压缩窗口)改写，让它按上游真实窗口压缩：
+  - Kiro 的点号版本改成连字符，例如 `claude-opus-4.6` 写成 `claude-opus-4-6`；自定义别名原样保留。
+  - 上游 1M 的加 `[1m]`，例如 `claude-opus-4-6[1m]`、`auto[1m]`。
+  - 不以 `claude-` 开头、上游不到 1M 的模型（如 `deepseek-3.2`）会写 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`；选了多个时取最小值。
 
 两种导出方式：
 
-- **直接使用**：给出 Claude Code 的 `~/.claude/settings.json` 片段、macOS / Linux 与 PowerShell 的环境变量、连通性测试 `curl`，以及 Anthropic / OpenAI 兼容客户端的 base URL。只设置 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，不设置 `ANTHROPIC_API_KEY`（两者同时存在时 Claude Code 会提示凭证冲突）。
-- **CC Switch 导入**：一键唤起 [CC Switch](https://ccswitch.io)，导入为 Claude Code 供应商，接口格式 Anthropic 原生（`apiFormat=anthropic`），Claude Code 直连本服务，不需要 CC Switch 本地路由；模型留空，沿用 Claude Code 自带的模型列表。链接形如 `ccswitch://v1/import?resource=provider&app=claude&name=…&endpoint=…&apiKey=…&apiFormat=anthropic`，也可以复制后发给 Key 的使用者自己点开。建议 CC Switch v4.0.10 及以上。
+- **直接使用**：给出 Claude Code 的 `~/.claude/settings.json` 片段、macOS / Linux 与 PowerShell 的环境变量、连通性测试 `curl`，以及 Anthropic / OpenAI 兼容客户端的 base URL。连接只设置 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，不设置 `ANTHROPIC_API_KEY`（两者同时存在时 Claude Code 会提示凭证冲突）；选了模型时再加 `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`。
+- **CC Switch 导入**：一键唤起 [CC Switch](https://ccswitch.io)，导入为 Claude Code 供应商，接口格式 Anthropic 原生（`apiFormat=anthropic`），Claude Code 直连本服务，不需要 CC Switch 本地路由。链接形如 `ccswitch://v1/import?resource=provider&app=claude&name=…&endpoint=…&apiKey=…&apiFormat=anthropic`，选了模型时带上 `model` / `opusModel` / `sonnetModel` / `haikuModel`，`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 放在 Base64 的 `config` 里（CC Switch v3.16.0 起才保留这类变量）；没选模型则沿用 Claude Code 自带的模型列表。也可以复制链接发给 Key 的使用者自己点开。建议 CC Switch v4.0.10 及以上。
 
 导出时 Admin UI 通过 `POST /api/admin/client-keys/{id}/export` 取回明文 Key（响应带 `Cache-Control: no-store`）。导入链接和配置片段都带着明文 Key，只发给这把 Key 的使用者。
 

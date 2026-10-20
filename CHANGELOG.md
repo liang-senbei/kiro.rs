@@ -39,6 +39,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   - **CC Switch 导入**：生成 `ccswitch://v1/import` 深链接，导入为 Claude Code 供应商、Anthropic 原生格式（`apiFormat=anthropic`），一键唤起 CC Switch 或复制链接发给使用者。
 - 服务地址默认取当前页面地址，可改成对外地址并被记住；本机 / 内网地址会提示。可选标准端点或 `/cc` 兼容端点。
 - 新增 `POST /api/admin/client-keys/{id}/export`，返回明文 Key（`Cache-Control: no-store`）。明文 Key 不再只在创建 / 轮换时可见，新建弹窗的提示文案随之更新。
+- 可选指定模型（主模型 / Opus / Sonnet / Haiku），选项取自新增的 `GET /api/admin/client-keys/{id}/models`（这把 Key 所在分组能用的模型，同 `/v1/models`，以 Admin 身份查询，不计入 Key 的调用）。写出的模型名按 Claude Code 的规则改写，让它按上游真实窗口压缩：点号版本改连字符，上游 1M 的加 `[1m]`，不以 `claude-` 开头且不到 1M 的模型写 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`。配置片段写成对应的 `ANTHROPIC_*_MODEL` 变量，CC Switch 链接带 `model` / `opusModel` / `sonnetModel` / `haikuModel`，额外变量放进 `config`。
 
 ### 🚦 账号突发限流（`USER_REQUEST_RATE_EXCEEDED`）
 

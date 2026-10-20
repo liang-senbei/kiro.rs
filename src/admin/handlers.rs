@@ -11,6 +11,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
+use crate::kiro::token_manager::ModelDiscoveryError;
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -1229,6 +1230,44 @@ pub async fn export_client_key(
     Path(id): Path<u64>,
 ) -> Response {
     export_client_key_response(id, state.client_keys.get(id))
+}
+
+/// GET /api/admin/client-keys/{id}/models
+///
+/// 这把 Key 所在分组能用的模型，格式同 `/v1/models`。供导出对话框选模型：
+/// 不拿客户端 Key 去调 `/v1/models`，免得打开对话框就被记成一次调用。
+pub async fn get_client_key_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> Response {
+    let Some(entry) = state.client_keys.get(id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response();
+    };
+    match state.service.models_for_group(entry.group.as_deref()).await {
+        Ok(upstream) => Json(crate::anthropic::types::ModelsResponse {
+            object: "list".to_string(),
+            data: crate::anthropic::aggregate_available_models(upstream),
+        })
+        .into_response(),
+        Err(error) => {
+            let status = match error {
+                ModelDiscoveryError::NoAvailableCredentials => StatusCode::SERVICE_UNAVAILABLE,
+                ModelDiscoveryError::ColdStartFailed { .. } => StatusCode::BAD_GATEWAY,
+            };
+            (
+                status,
+                Json(super::types::AdminErrorResponse::api_error(error.to_string())),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn export_client_key_response(id: u64, entry: Option<super::client_keys::ClientKey>) -> Response {

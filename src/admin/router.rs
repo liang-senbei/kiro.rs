@@ -14,7 +14,7 @@ use super::{
         check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
-        export_client_key, export_credentials, force_refresh_token, get_account_rpm_limit_config,
+        export_client_key, export_credentials, get_client_key_models, force_refresh_token, get_account_rpm_limit_config,
         get_account_throttle_config, get_all_credentials,
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
         get_current_models, get_global_proxy, get_custom_models,
@@ -213,6 +213,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/client-keys/{id}/rotate", post(rotate_client_key))
         .route("/client-keys/{id}/export", post(export_client_key))
+        .route("/client-keys/{id}/models", get(get_client_key_models))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{name}", delete(delete_group).patch(update_group))
         .route("/stats/overview", get(stats_overview))

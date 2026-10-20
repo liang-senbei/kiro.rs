@@ -759,7 +759,7 @@ fn aggregate_available_models_with_custom(
     models.into_values().collect()
 }
 
-fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
+pub(crate) fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
     aggregate_available_models_with_custom(upstream_models, &crate::model::custom_models::all())
 }
 

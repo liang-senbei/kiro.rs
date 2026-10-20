@@ -501,6 +501,12 @@ export interface ExportClientKeyResponse {
   group?: string
 }
 
+// GET /api/admin/client-keys/{id}/models，与 /v1/models 同格式
+export interface ClientKeyModelsResponse {
+  object: string
+  data: { id: string; display_name?: string; owned_by?: string; context_window?: number; max_tokens?: number }[]
+}
+
 // ============ 用量统计 ============
 
 export type StatsRange = '24h' | '7d' | '30d'

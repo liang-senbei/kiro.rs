@@ -43,3 +43,5 @@ mod gateway_tests;
 pub use router::create_router_with_provider;
 #[allow(unused_imports)]
 pub use router::{create_router, create_router_with_shared_provider};
+/// `/v1/models` 的合并逻辑，Admin 按客户端 Key 分组列模型时复用。
+pub(crate) use handlers::aggregate_available_models;

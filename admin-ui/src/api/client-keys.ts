@@ -5,6 +5,7 @@ import type {
   CreateClientKeyRequest,
   CreateClientKeyResponse,
   ExportClientKeyResponse,
+  ClientKeyModelsResponse,
   UpdateClientKeyRequest,
   SuccessResponse,
 } from '@/types/api'
@@ -76,5 +77,11 @@ export async function rotateClientKey(id: number): Promise<CreateClientKeyRespon
 /** 取回明文 Key 用于导出配置。走 POST（服务端带 no-store），不进 react-query 缓存 */
 export async function exportClientKey(id: number): Promise<ExportClientKeyResponse> {
   const { data } = await api.post<ExportClientKeyResponse>(`/client-keys/${id}/export`)
+  return data
+}
+
+// 这把 Key 所在分组能用的模型（格式同 /v1/models），用 Admin 身份查，不记作 Key 的调用
+export async function getClientKeyModels(id: number): Promise<ClientKeyModelsResponse> {
+  const { data } = await api.get<ClientKeyModelsResponse>(`/client-keys/${id}/models`)
   return data
 }

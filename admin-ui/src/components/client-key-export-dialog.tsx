@@ -6,12 +6,16 @@ import { Input } from '@/components/ui/input'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from '@/components/ui/dialog'
-import { exportClientKey } from '@/api/client-keys'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
+import { exportClientKey, getClientKeyModels } from '@/api/client-keys'
+import { getCurrentCredentialModels, getCustomModels } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import {
-  anthropicBaseUrl, ccSwitchImportLink, claudeCodeSettingsJson, curlTest, isLocalAddress,
-  maskSecret, normalizeBaseUrl, openAiBaseUrl, powershellExports, shellExports,
-  type ExportEndpointMode, type ExportTarget,
+  anthropicBaseUrl, ccSwitchImportLink, claudeCodeModelEnv, claudeCodeSettingsJson, curlTest,
+  hasExtraModelEnv, isLocalAddress, maskSecret, normalizeBaseUrl, openAiBaseUrl, powershellExports, shellExports,
+  type ExportEndpointMode, type ExportModel, type ExportModelSlots, type ExportTarget,
 } from '@/lib/client-key-export'
 
 /** 要导出的 Key：刚创建 / 轮换时带上明文 `key`，否则打开对话框时向服务端取回 */
@@ -26,6 +30,55 @@ type ExportTab = 'direct' | 'ccswitch'
 
 /** 记住管理员填过的服务地址（经内网访问面板、对外是公网域名的情况） */
 const BASE_URL_STORAGE_KEY = 'kiro-rs.clientKeyExport.baseUrl'
+
+/** Claude Code 自己决定压缩阈值；手改模型名时这几类不处理会被它按 200K 压缩 */
+const ONE_M_HINT = (
+  <>
+    上面选了模型会自动处理。自己改模型名时注意：Opus 4.7+、Sonnet 5+ 用官方写法（如
+    {' '}<code>claude-opus-4-8</code>）时 Claude Code 默认按 1M 压缩；Opus 4.6、Sonnet 4.6、Kiro 的点号写法
+    （如 <code>claude-opus-4.8</code>），以及 <code>auto</code>、<code>kimi-k3</code> 这类上游为 1M 但
+    Claude Code 不认识的模型名，要在模型名后加 <code>[1m]</code>（如 <code>claude-opus-4-6[1m]</code>），
+    否则它按 200K 压缩；上游不到 1M 的模型不要加。
+  </>
+)
+
+const MODEL_SLOTS: { slot: keyof ExportModelSlots; label: string }[] = [
+  { slot: 'main', label: '主模型' },
+  { slot: 'opus', label: 'Opus' },
+  { slot: 'sonnet', label: 'Sonnet' },
+  { slot: 'haiku', label: 'Haiku' },
+]
+
+/** Select 不接受空字符串值，用它表示「不指定」 */
+const NO_MODEL = '__none__'
+
+function formatWindow(tokens: number): string {
+  if (tokens >= 1_000_000 && tokens % 1_000_000 === 0) return `${tokens / 1_000_000}M`
+  return `${Math.round(tokens / 1000)}K`
+}
+
+/**
+ * 这把 Key 能用的模型：按它所在分组列出（含自定义别名，同 `/v1/models`）。
+ * 用 Admin 身份查，不拿客户端 Key 发请求，免得打开对话框就被记成一次调用。
+ * 查不到时（如分组里没有可用凭据）退回账号池当前凭据的模型列表。
+ */
+async function loadExportModels(keyId: number): Promise<ExportModel[]> {
+  const customIds = getCustomModels()
+    .then((r) => new Set(r.models.map((m) => m.id.toLowerCase())))
+    .catch(() => new Set<string>())
+  try {
+    const { data } = await getClientKeyModels(keyId)
+    const custom = await customIds
+    return data.map((m) => ({
+      id: m.id,
+      contextWindow: m.context_window ?? 0,
+      custom: custom.has(m.id.toLowerCase()),
+    }))
+  } catch {
+    const fallback = await getCurrentCredentialModels()
+    return fallback.models.map((m) => ({ id: m.modelId, contextWindow: m.maxInputTokens ?? 0 }))
+  }
+}
 
 function loadBaseUrl(): string {
   try {
@@ -133,6 +186,9 @@ export function ClientKeyExportDialog({
   const [endpointMode, setEndpointMode] = useState<ExportEndpointMode>('standard')
   const [providerName, setProviderName] = useState(`kiro-rs · ${subject.name}`)
   const [reveal, setReveal] = useState(false)
+  const [models, setModels] = useState<ExportModel[] | null>(null)
+  const [modelsError, setModelsError] = useState<string | null>(null)
+  const [slots, setSlots] = useState<ExportModelSlots>({})
 
   useEffect(() => {
     if (subject.key) return
@@ -151,6 +207,23 @@ export function ClientKeyExportDialog({
     }
   }, [subject.id, subject.key])
 
+  useEffect(() => {
+    let cancelled = false
+    loadExportModels(subject.id)
+      .then((list) => {
+        if (!cancelled) setModels(list)
+      })
+      .catch((err) => {
+        if (!cancelled) setModelsError(extractErrorMessage(err))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [subject.id])
+
+  const modelEnv = useMemo(() => claudeCodeModelEnv(slots, models ?? []), [slots, models])
+  const testModel = slots.main ?? slots.sonnet ?? slots.opus ?? slots.haiku
+
   const baseUrlValid = useMemo(() => {
     try {
       const u = new URL(normalizeBaseUrl(baseUrlInput))
@@ -161,7 +234,9 @@ export function ClientKeyExportDialog({
   }, [baseUrlInput])
 
   const target: ExportTarget | null =
-    apiKey && baseUrlValid ? { baseUrl: baseUrlInput, apiKey, endpointMode } : null
+    apiKey && baseUrlValid
+      ? { baseUrl: baseUrlInput, apiKey, endpointMode, modelEnv, testModel }
+      : null
   const show = (text: string) => (reveal || !apiKey ? text : maskSecret(text, apiKey))
   const local = baseUrlValid && isLocalAddress(baseUrlInput)
 
@@ -276,6 +351,49 @@ export function ClientKeyExportDialog({
               </div>
             </div>
 
+            <div className="space-y-1.5">
+              <label className="text-[12px] text-muted-foreground">模型（可选）</label>
+              {modelsError ? (
+                <p className="text-[11px] text-destructive">读取模型列表失败：{modelsError}</p>
+              ) : !models ? (
+                <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  正在读取模型列表…
+                </div>
+              ) : (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {MODEL_SLOTS.map(({ slot, label }) => (
+                    <div key={slot} className="flex items-center gap-2">
+                      <span className="w-12 shrink-0 text-[12px] text-muted-foreground">{label}</span>
+                      <Select
+                        value={slots[slot] ?? NO_MODEL}
+                        onValueChange={(v) =>
+                          setSlots((prev) => ({ ...prev, [slot]: v === NO_MODEL ? undefined : v }))
+                        }
+                      >
+                        <SelectTrigger className="h-8 min-w-0 flex-1 rounded-md px-2.5 font-mono text-[12px]">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={NO_MODEL}>不指定</SelectItem>
+                          {models.map((m) => (
+                            <SelectItem key={m.id} value={m.id}>
+                              {m.contextWindow > 0 ? `${m.id} · ${formatWindow(m.contextWindow)}` : m.id}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <p className="text-[11px] text-muted-foreground">
+                不选就用 Claude Code 自带的模型。选了的会写成 Claude Code 认得的名字，让它按上游真实窗口压缩：
+                版本号改成连字符，上游 1M 的加 <code>[1m]</code>；不以 <code>claude-</code> 开头且不到 1M 的模型
+                会写 <code>CLAUDE_CODE_MAX_CONTEXT_TOKENS</code>。Haiku 是 Claude Code 后台小任务用的模型。
+              </p>
+            </div>
+
             <Segmented
               value={tab}
               onChange={setTab}
@@ -295,6 +413,8 @@ export function ClientKeyExportDialog({
                     <>
                       合并进已有的 <code>env</code> 字段即可。只用 <code>ANTHROPIC_AUTH_TOKEN</code>，
                       不要同时设置 <code>ANTHROPIC_API_KEY</code>，否则 Claude Code 会提示凭证冲突。
+                      <br />
+                      {ONE_M_HINT}
                     </>
                   }
                 />
@@ -332,8 +452,16 @@ export function ClientKeyExportDialog({
                   导入为 CC Switch 里的 <strong className="text-foreground">Claude Code</strong> 供应商，接口格式
                   <strong className="text-foreground"> Anthropic 原生</strong>（<code>apiFormat=anthropic</code>）：
                   Claude Code 直接请求 <code className="break-all">{anthropicBaseUrl(target)}</code>，
-                  不需要开 CC Switch 本地路由。模型留空，Claude Code 用自带的模型列表。
+                  不需要开 CC Switch 本地路由。
+                  {Object.keys(modelEnv).length === 0
+                    ? '模型留空，Claude Code 用自带的模型列表。'
+                    : '同时写入上面选的模型：'}
                 </p>
+                {Object.keys(modelEnv).length > 0 && (
+                  <pre className="whitespace-pre-wrap break-all rounded-md border border-border bg-muted/40 p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
+                    {Object.entries(modelEnv).map(([k, v]) => `${k}=${v}`).join('\n')}
+                  </pre>
+                )}
                 <div>
                   <label className="text-[12px] text-muted-foreground">供应商名称</label>
                   <Input value={providerName} onChange={(e) => setProviderName(e.target.value)} />
@@ -367,6 +495,13 @@ export function ClientKeyExportDialog({
                     </a>
                     （建议 v4.0.10 及以上；更早的版本忽略接口格式参数，按 Claude Code 默认的 Anthropic 格式导入，同样可用）。
                   </p>
+                  {hasExtraModelEnv(modelEnv) && (
+                    <p className="text-amber-600 dark:text-amber-400">
+                      <code>CLAUDE_CODE_MAX_CONTEXT_TOKENS</code> 需要 CC Switch v3.16.0 及以上才会导入，更早的版本会悄悄丢掉，
+                      请在供应商的环境变量里照上面手动补上。
+                    </p>
+                  )}
+                  <p>{ONE_M_HINT}</p>
                   <p className="text-amber-600 dark:text-amber-400">
                     导入链接里带着明文 Key，等同 Key 本身，只发给这把 Key 的使用者，不要贴到公开群里。
                     同一条链接导入两次会在 CC Switch 里生成两份。
