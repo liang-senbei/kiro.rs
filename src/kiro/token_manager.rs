@@ -1624,6 +1624,7 @@ impl MultiTokenManager {
     fn remove_model_cache(&self, id: u64) {
         self.invalidate_model_cache(id);
         self.model_refresh_locks.lock().remove(&id);
+        crate::model::upstream_limits::forget(id);
     }
 
     pub fn invalidate_all_model_caches(&self) {
@@ -1697,6 +1698,8 @@ impl MultiTokenManager {
                     },
                 );
             }
+            // 窗口不随 epoch 失效：清缓存只是让列表重新拉取，模型窗口本身没变。
+            crate::model::upstream_limits::record(id, &response);
         }
         Ok(response)
     }

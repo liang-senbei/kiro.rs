@@ -538,12 +538,23 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 动态模型缓存也用于凭据路由：已确认包含目标模型的凭据优先，已加载缓存且明确不包含目标模型的凭据会跳过；尚未加载缓存的凭据仍允许尝试，因此模型列表接口暂时不可用不会形成新的本地白名单。
 
-上下文窗口估算：
+上下文窗口：Kiro 只回报上下文占用百分比，kiro-rs 按「百分比 × 窗口」换算成 usage 里的输入 token，客户端的上下文进度条和自动压缩都看这个数。窗口按以下顺序取：
 
-- `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`：`1_000_000`（静态模型声明最大输出为 `64_000`）
-- 其它 `gpt-5.*`：`272_000`
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-fable-5`：`1_000_000`
-- 其它模型：`200_000`
+1. `customModels` 里显式写的 `contextWindow`。
+2. 上游模型列表（`ListAvailableModels`）给出的 `maxInputTokens`。启动时预热，之后按凭据缓存；切换代理或修改自定义模型时不会丢。
+3. 模型列表还没拿到时的内置兜底：Claude 4.6 之前的版本（3.x、4、4.1、4.5）和 `glm-5` 为 `200_000`，`deepseek-3.2` 为 `164_000`，`minimax-m2.*` 为 `196_000`，`qwen3-coder-*` 为 `256_000`，`gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` 为 `922_000`，其它 `gpt-*` 为 `272_000`；**其余模型一律按 `1_000_000`**。
+
+目前 Kiro 上 Opus 4.6 及以上、Sonnet 4.6 / 5 / 5.5、`auto`、`kimi-k3` 都是 1M。
+
+#### Claude Code 自己的压缩窗口
+
+Claude Code 在哪里压缩由它自己判断，kiro-rs 只负责把 usage 按真实窗口报准。所以 Claude Code 认定的窗口要和上游一致：
+
+- Opus 4.7 及以上、Sonnet 5 及以上、Fable 5 / 5.1：用 Anthropic 官方写法（如 `claude-opus-4-8`、`claude-sonnet-5-5`，或 `opus` / `sonnet` 别名）时，Claude Code 原生按 1M 计算，不用配置。`/v1/models` 列出的是 Kiro 的点号写法（如 `claude-opus-4.8`），Claude Code 认不出，会按 200K 算。请改用连字符写法（kiro-rs 照样映射），或在后面加 `[1m]`。
+- Opus 4.6、Sonnet 4.6：只有模型名带 `[1m]` 才按 1M，否则 Claude Code 按 200K 压缩。例如 `/model claude-opus-4-6[1m]`，或在 `env` 里设 `"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-6[1m]"`。后缀会在发请求前去掉；如果原样发来，kiro-rs 也会自己剥掉。
+- 上游是 1M、但 Claude Code 不认识的模型名（`auto`、`kimi-k3`，或 `backendId` 指向 1M 模型的自定义别名）：Claude Code 默认按 200K，要在模型名后加 `[1m]`。也可以设 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`，但它对所有不认识、且不以 `claude-` 开头的模型名一起生效，`glm-5`、`deepseek-3.2` 等也会被当成 1M、不再自动压缩。
+- 上游窗口小于约 167K 的模型（目前是 `deepseek-3.2`，164K）：Claude Code 按 200K 算，压缩线约 167K。usage 到 100% 也够不到这条线，所以不会自动压缩，会直接撞上游上限。用这类模型不要加 `[1m]`，可设 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000` 提前压缩（对当前环境的所有模型生效）。
+- `autoCompactWindow` / `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 只能把阈值调低，不会超过 Claude Code 认定的模型窗口。例如设成 `600000`，对按 200K 计算的模型名不起作用。
 
 ### 自定义模型
 
@@ -556,7 +567,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
       "id": "my-opus",                 // 客户端请求用的模型名（大小写不敏感精确匹配）
       "backendId": "claude-opus-4.8",  // 实际下发给 Kiro 的后端模型 ID（必填）
       "displayName": "My Opus",        // 可选，/v1/models 展示名，缺省用 id
-      "contextWindow": 1000000,         // 可选，上下文窗口，缺省 200000
+      "contextWindow": 1000000,         // 可选，上下文窗口，缺省按上游 maxInputTokens
       "maxTokens": 64000,               // 可选，/v1/models 展示的最大输出，缺省 64000
       "supportsReasoning": true,        // 可选，是否放行原生 reasoning，缺省 false
       "ownedBy": "custom"               // 可选，/v1/models 的 owned_by，缺省 "custom"
@@ -570,7 +581,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 - **匹配**：按 `id` 大小写不敏感精确匹配；客户端传 `my-opus-thinking` 时，若无同名精确条目，会自动剥离 `-thinking` 后缀回退到 `my-opus`。
 - **优先级**：命中自定义表直接返回其 `backendId`，不再走内置关键词映射，因此可用同名 `id` 覆盖内置模型的后端指向。
 - **展示**：所有 `customModels` 条目会合并到 `GET /v1/models`，同名时自定义展示名、所有者和最大输出 token 元数据优先；最终列表按模型 ID 稳定排序。
-- **上下文窗口**：设了 `contextWindow` 时以其为准，否则回退到内置估算。
+- **上下文窗口**：设了 `contextWindow` 时以其为准，否则按 `backendId` 查上游 `maxInputTokens`，再不行用上面的内置兜底。一般留空即可。
 - **reasoning**：`supportsReasoning: true` 会让该 `backendId` 放行 `additionalModelRequestFields`（`output_config` 等）；后端不接受时上游会返回 400，此时置 false 即可。
 - **兼容性**：默认空数组，现有配置无需迁移；`/v1/chat/completions` 与 `/v1/responses` 因复用同一映射链路自动生效。
 

@@ -6,7 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-主题：**合并 upstream master、多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复，以及客户端 Key 一键导出（直接使用 / CC Switch）**。
+主题：**合并 upstream master、多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复、客户端 Key 一键导出（直接使用 / CC Switch），以及上下文窗口改按上游取值、不再兜底 200K**。
+
+### 📏 上下文窗口不再兜底 200K
+
+- 换算 `contextUsage` 百分比时，窗口改为优先取上游 `ListAvailableModels` 的 `maxInputTokens`（按 `map_model` 后的 Kiro id 查，多凭据取最大值）。这份记录单独保存，切换代理、修改自定义模型清空模型缓存时不会丢；凭据删除时移除。
+- 内置表只在模型列表还没拿到时兜底，只列已知小于 1M 的模型（Claude 4.6 之前的版本、`glm-5`、`deepseek-3.2`、`minimax-m2.*`、`qwen3-coder-*`、GPT），**其余模型默认 `1_000_000`**，不再回退 `200_000`。此前 `claude-sonnet-5.5` 这类 Claude Code 原生按 1M 计算的模型被按 200K 换算，usage 少报 5 倍，Claude Code 迟迟不压缩，一直撑到上游超限。
+- `gpt-5.6-sol` / `terra` / `luna` 的兜底值改为上游实际给出的 `922_000`。
+- 模型名末尾的 `[1m]`（Claude Code 的 1M 上下文后缀）在映射前去掉，原样发来也不会透传给 Kiro；自定义模型 id 本身带 `[1m]` 时仍按原样优先匹配。
+- 文档、`customModels.contextWindow` 说明和管理端占位符不再写「缺省 200000」。README「Claude Code 自己的压缩窗口」和导出对话框说明了 Claude Code 在哪些模型名下会按 200K 压缩、怎么改。
+- **升级注意（Claude Code）**：
+  - `auto`、`kimi-k3` 以及指向 1M 后端的自定义别名，以前按 200K 换算，恰好和 Claude Code 对不认识的模型名的 200K 假设抵消。现在按真实 1M 上报，不在模型名后加 `[1m]` 的话，Claude Code 会在约 200K 真实 token 时压缩。在客户端 Key 导出里选上模型会自动写好。
+  - `deepseek-3.2`（上游 164K）正好相反：usage 到 100% 也够不到 Claude Code 按 200K 算的压缩线，不会再自动压缩，可设 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000`。
 
 ### 🔀 合并 upstream（ZyphrZero/kiro.rs master @ `8cbd7fa`）
 

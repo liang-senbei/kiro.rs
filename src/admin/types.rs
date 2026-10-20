@@ -1385,7 +1385,7 @@ pub struct CustomModelItem {
     /// `/v1/models` 展示名（可选，缺省用 `id`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// 上下文窗口大小（可选，缺省 200000）。
+    /// 上下文窗口大小（可选；缺省按上游 `maxInputTokens`，取不到时用内置兜底，未知模型 1M）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i32>,
     /// 单次响应最大 token 数（可选，缺省 64000）。

@@ -278,6 +278,20 @@ fn normalize_claude_model(model: &str) -> Option<String> {
     Some(format!("claude-{}-{}", parts[family_index], version))
 }
 
+/// 去掉 Claude Code 的 `[1m]` 上下文后缀。
+///
+/// 这个后缀只告诉 Claude Code 按 1M 计算压缩阈值，它正常会在发请求前自己去掉；
+/// 个别版本或手写配置原样发来时在这里兜一次，免得整串透传给 Kiro。
+fn strip_context_suffix(model: &str) -> &str {
+    let trimmed = model.trim_end();
+    match trimmed.len().checked_sub("[1m]".len()) {
+        Some(at) if trimmed.is_char_boundary(at) && trimmed[at..].eq_ignore_ascii_case("[1m]") => {
+            &trimmed[..at]
+        }
+        _ => model,
+    }
+}
+
 /// 模型映射：自定义别名优先，已知 Claude 格式规范化，其余合法 ID 原样透传。
 pub fn map_model(model: &str) -> Option<String> {
     if invalid_model_reason(model).is_some() {
@@ -285,57 +299,104 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 
     // 自定义模型表优先（大小写不敏感精确匹配），可新增或覆盖内置映射。
-    if let Some(custom) = crate::model::custom_models::lookup(model) {
+    if let Some(custom) = lookup_custom_model(model) {
         return Some(custom.backend_id);
     }
 
+    let model = strip_context_suffix(model);
+    if invalid_model_reason(model).is_some() {
+        return None;
+    }
     normalize_claude_model(model).or_else(|| Some(model.to_string()))
 }
 
+/// 先按原样查自定义模型（id 本身可能就带 `[1m]`），没命中再去掉后缀查。
+fn lookup_custom_model(model: &str) -> Option<crate::model::config::CustomModel> {
+    crate::model::custom_models::lookup(model)
+        .or_else(|| crate::model::custom_models::lookup(strip_context_suffix(model)))
+}
+
+/// 上游没有给出窗口、内置表也没有记录的模型按 1M 处理。
+///
+/// Kiro 现役的 Claude 4.6+ / 5.x、`auto`、kimi-k3 都是 1M，新上线的模型也多是 1M；
+/// 已知更小的模型在 [`builtin_context_window`] 里单独列出。
+pub const DEFAULT_CONTEXT_WINDOW: i32 = 1_000_000;
+
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 同 1M
+/// 本函数的返回值会在 `Event::ContextUsage` 处把上游只回报的百分比换算成
+/// token 数（`pct × window / 100`），客户端的上下文进度条和自动压缩都依赖它：
+/// 窗口偏小会把 usage 少报（1M 模型按 200K 算就少报 5 倍，客户端迟迟不压缩，
+/// 一直撑到上游超限），偏大则会多报，让客户端过早压缩。
 ///
-/// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
-/// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
-/// 发往上游的请求，但会让该模型的 usage 上报缩小 5 倍，进而使客户端的
-/// 上下文进度条与自动压缩阈值全部失准。新增 1M 模型时务必同步此处。
+/// 取值顺序：
+/// 1. 自定义模型显式声明的 `contextWindow`；
+/// 2. 上游 `ListAvailableModels` 给出的 `maxInputTokens`（按 `map_model` 后的 Kiro id 查）；
+/// 3. 还没拿到模型列表时（刚启动、该凭据拉取失败）用内置表兜底，未知模型按 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     // 自定义模型若显式声明了上下文窗口，优先返回。
-    if let Some(custom) = crate::model::custom_models::lookup(model) {
-        if let Some(window) = custom.context_window {
-            return window;
-        }
+    if let Some(window) = lookup_custom_model(model).and_then(|custom| custom.context_window) {
+        return window;
     }
 
-    match map_model(model) {
-        // Kiro exposes the GPT-5.6 family with a 1M context window.
-        Some(mapped)
-            if matches!(
-                mapped.as_str(),
-                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
-            ) =>
-        {
-            1_000_000
-        }
-        // Keep the existing fallback for other GPT models until their limits are confirmed.
-        Some(mapped) if mapped.starts_with("gpt") => 272_000,
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-opus-5"
-                || mapped == "claude-opus-5.5"
-                || mapped == "claude-fable-5" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
+    let Some(mapped) = map_model(model) else {
+        return DEFAULT_CONTEXT_WINDOW;
+    };
+    crate::model::upstream_limits::max_input_tokens(&mapped)
+        .unwrap_or_else(|| builtin_context_window(&mapped))
+}
+
+/// 冷启动兜底：模型列表还没加载时使用。
+///
+/// 只列已知小于 1M 的模型，数值取自 2026-10 上游 `ListAvailableModels`；
+/// 其余（含未来的新模型）一律按 [`DEFAULT_CONTEXT_WINDOW`]。
+fn builtin_context_window(mapped: &str) -> i32 {
+    // 自定义模型的 backendId 原样透传，可能是 claude-haiku-4-5 这类未规范化写法。
+    let id = normalize_claude_model(mapped).unwrap_or_else(|| mapped.to_ascii_lowercase());
+    if matches!(
+        id.as_str(),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    ) {
+        return 922_000;
+    }
+    // 其它 GPT 模型的窗口尚未确认，沿用原有估算。
+    if id.starts_with("gpt") {
+        return 272_000;
+    }
+    if is_pre_1m_claude(&id) || id == "glm-5" {
+        return 200_000;
+    }
+    if id.starts_with("deepseek-3.2") {
+        return 164_000;
+    }
+    if id.starts_with("minimax-m2") {
+        return 196_000;
+    }
+    if id.starts_with("qwen3-coder") {
+        return 256_000;
+    }
+    DEFAULT_CONTEXT_WINDOW
+}
+
+/// Claude 4.6 之前的版本（3.x、4、4.1、4.5）只有 200K 窗口。
+///
+/// 入参是 `normalize_claude_model` 的输出（`claude-<family>-<major>[.<minor>]`）。
+fn is_pre_1m_claude(id: &str) -> bool {
+    let Some((_, version)) = id
+        .strip_prefix("claude-")
+        .and_then(|body| body.split_once('-'))
+    else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|v| v.parse::<u32>().ok());
+    let minor = match parts.next() {
+        Some(v) => v.parse::<u32>().ok(),
+        None => Some(0),
+    };
+    match (major, minor, parts.next()) {
+        (Some(major), Some(minor), None) => major < 4 || (major == 4 && minor < 6),
+        _ => false,
     }
 }
 
@@ -2226,7 +2287,7 @@ mod tests {
         assert_eq!(get_context_window_size("claude-opus-4-5"), 200_000);
     }
 
-    /// 1M 名单的整体校验：新增 1M 模型时应同步此处，避免再次漏配。
+    /// 已知 1M 模型的整体校验。
     #[test]
     fn test_context_window_1m_family() {
         for model in [
@@ -2247,14 +2308,92 @@ mod tests {
                 "{model} 应为 1M 上下文窗口"
             );
         }
-        // 未纳入 1M 的模型仍回退 200k
-        for model in ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5"] {
+        // Claude 4.6 之前的版本只有 200K
+        for model in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-1-20250805",
+            "claude-sonnet-4-20250514",
+            "claude-3-7-sonnet-20250219",
+        ] {
             assert_eq!(
                 get_context_window_size(model),
                 200_000,
-                "{model} 应回退 200k"
+                "{model} 应为 200K 上下文窗口"
             );
         }
+    }
+
+    /// 内置表之外的模型按 1M 处理，不再回退 200K。
+    #[test]
+    fn test_context_window_defaults_to_1m() {
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-mythos-5",
+            "claude-opus-6",
+            "claude-opus-5-beta",
+            "auto",
+            "kimi-k3",
+            "some-future-model",
+        ] {
+            assert_eq!(
+                get_context_window_size(model),
+                DEFAULT_CONTEXT_WINDOW,
+                "{model} 应默认 1M"
+            );
+        }
+        assert_eq!(DEFAULT_CONTEXT_WINDOW, 1_000_000);
+    }
+
+    /// 冷启动兜底里已知更小的非 Claude 模型。
+    #[test]
+    fn test_context_window_builtin_smaller_models() {
+        assert_eq!(get_context_window_size("deepseek-3.2"), 164_000);
+        assert_eq!(get_context_window_size("minimax-m2.5"), 196_000);
+        assert_eq!(get_context_window_size("qwen3-coder-next"), 256_000);
+        assert_eq!(get_context_window_size("glm-5"), 200_000);
+    }
+
+    /// 上游 maxInputTokens 优先于内置表。
+    #[test]
+    fn test_context_window_prefers_upstream_limits() {
+        let response: crate::kiro::model::available_models::ListAvailableModelsResponse =
+            serde_json::from_value(serde_json::json!({
+                "models": [
+                    { "modelId": "claude-haiku-4.5", "tokenLimits": { "maxInputTokens": 300000 } },
+                    { "modelId": "kimi-k3", "tokenLimits": { "maxInputTokens": 512000 } }
+                ]
+            }))
+            .unwrap();
+        crate::model::upstream_limits::record(7, &response);
+
+        // 按 map_model 后的 Kiro id 查找，客户端写法不影响命中
+        assert_eq!(
+            get_context_window_size("claude-haiku-4-5-20251001"),
+            300_000
+        );
+        assert_eq!(get_context_window_size("kimi-k3"), 512_000);
+        // 上游没列出的模型仍走内置表
+        assert_eq!(get_context_window_size("claude-sonnet-4-5"), 200_000);
+
+        crate::model::upstream_limits::forget(7);
+        assert_eq!(get_context_window_size("claude-haiku-4-5"), 200_000);
+    }
+
+    #[test]
+    fn test_map_model_strips_context_suffix() {
+        assert_eq!(
+            map_model("claude-opus-4-6[1m]"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-4-6[1M]"),
+            Some("claude-sonnet-4.6".to_string())
+        );
+        assert_eq!(map_model("kimi-k3[1m]"), Some("kimi-k3".to_string()));
+        assert!(map_model("[1m]").is_none());
+        assert_eq!(get_context_window_size("claude-haiku-4-5[1m]"), 200_000);
     }
 
     #[test]
@@ -2272,8 +2411,8 @@ mod tests {
             assert_eq!(map_model(model), Some(model.to_string()));
             assert_eq!(
                 get_context_window_size(model),
-                1_000_000,
-                "{model} should use the 1M context window"
+                922_000,
+                "{model} should use the upstream 922K input window"
             );
         }
 

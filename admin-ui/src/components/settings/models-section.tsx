@@ -399,7 +399,7 @@ export function ModelsSection() {
                           const v = e.target.value
                           updateField(i, 'contextWindow', v === '' ? undefined : Number(v))
                         }}
-                        placeholder="200000"
+                        placeholder="自动"
                         disabled={customSaving}
                         className="h-7 text-[12.5px] [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                       />
@@ -515,7 +515,7 @@ export function ModelsSection() {
                             const v = e.target.value
                             updateField(i, 'contextWindow', v === '' ? undefined : Number(v))
                           }}
-                          placeholder="200000"
+                          placeholder="留空按上游"
                           disabled={customSaving}
                           className="h-8 text-[12.5px] [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                         />
