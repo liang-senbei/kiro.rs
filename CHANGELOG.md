@@ -8,6 +8,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 主题：**合并 upstream master、多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复、客户端 Key 一键导出（直接使用 / CC Switch），以及上下文窗口改按上游取值、不再兜底 200K**。
 
+### 🔀 合并 upstream v0.9.2（ZyphrZero/kiro.rs master @ `711c3e6`）
+
+- 合入 upstream `8cbd7fa` 之后的 7 个提交，即 `v0.9.2` 和其后的模型冷却移除，内容见下方 [0.9.2]。
+- 去掉模型级冷却（upstream c12f6a3）：上游返回 `MODEL_TEMPORARILY_UNAVAILABLE` 时只让本次请求回 503 + `Retry-After`，不再让该模型之后几秒的所有请求都直接 503。上面「合并 upstream」一节里「该模型短暂冷却」的说法随之作废。
+- 内容过滤拒答（upstream 9c2d2b3）接进本 fork 的结构：非流式在 `parse_non_stream_attempt` 里识别，流式在 `generate_final_events` 里处理。拒答是显式终态，不触发透明重试；拒答截在工具调用中途时，丢弃还在累积的工具调用、不报 JSON 错误；已经完整、只是在等 meteringEvent 的工具调用照常发出。
+- 本 fork 的超时默认值不变：`upstreamTotalTimeoutSecs` 仍默认 `0`、`upstreamReadTimeoutSecs` 仍默认 `720`（upstream 分别是 `720`、`120`）。
+- 版本号随 upstream 改为 `0.9.2`。
+
 ### 📏 上下文窗口不再兜底 200K
 
 - 换算 `contextUsage` 百分比时，窗口改为优先取上游 `ListAvailableModels` 的 `maxInputTokens`（按 `map_model` 后的 Kiro id 查，多凭据取最大值）。这份记录单独保存，切换代理、修改自定义模型清空模型缓存时不会丢；凭据删除时移除。
@@ -64,6 +72,79 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 4f1dd58 / 1a9e786：所有 SSE 响应加 `x-accel-buffering: no`，前置 nginx 不再缓冲流式输出。
 - 74095ef：历史中带 `pages` 的 `Read` 调用不再让会话之后每一轮都失败。
 - 4640216 / dee54de：Claude Opus 5.5 与 gpt-5.6 系列按 1M 上下文窗口换算 `input_tokens`（以前分别按 200K / 272K，少报导致客户端压缩上下文过晚）。
+
+## [0.9.2] - 2026-10-18
+
+主题：**流式首字延迟与上游超时、上游域名切换、Codex / WebSearch 缓存与费用计量，以及内容过滤拒答透传**。本版汇总 `v0.9.1` 之后合并的 8 个 PR；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。
+
+### ⚡ 流式首字延迟与上游超时
+
+> 来源：[PR #110](https://github.com/ZyphrZero/kiro.rs/pull/110)，提交人：[@yeeyon](https://github.com/yeeyon)；[PR #117](https://github.com/ZyphrZero/kiro.rs/pull/117)，提交人：[@childe](https://github.com/childe)。感谢贡献。
+
+- `/cc/v1/messages` 与 `/v1/chat/completions` 改为边收边发，不再等上游生成完毕才输出；Chat Completions 增量转换文本、分片工具参数和最终用量。CC 的初始用量为估算值，最终 `message_delta` 给出上游用量，客户端应以最终用量为准。
+- 去掉强制的 `Connection: close`，复用上游连接；本地对照测试中首个内容 P50 从约 235 ms 降到约 31 ms，总完成时间不变。网关只去掉了缓冲，不会加快上游模型生成。复现方法见 `docs/gateway-performance.md`。
+- 新增 `upstreamConnectTimeoutSecs`（默认 `15`）与 `upstreamReadTimeoutSecs`（默认 `120`）。读超时限制上游静默时长，有数据到达即重置，不限制正在输出的回答；等待响应头或读取错误体超时返回 504，不再重复等待。
+- 新增 `upstreamTotalTimeoutSecs`（默认 `720`，即原来写死的值）。活跃流不会重置该期限，因此它同时是单轮回答的时长上限：长 agentic 轮次在 12 分钟被截断时可调大，设为 `0` 则取消上限，仅依赖读超时。
+- 上游精确返回 `MODEL_TEMPORARILY_UNAVAILABLE` 时直接返回 503 与 `Retry-After`，不再内部重试三次后返回笼统的 502；该模型短暂冷却（默认 5 秒，优先采用上游 `Retry-After`），其他模型不受影响。
+- 非流式响应逐帧解码，修复完整响应超过 16 MB 解码缓冲时返回空成功的问题；空响应体、损坏或截断的帧、上游错误事件与连接中断都明确报错，不再当作正常完成。
+- trace 首字耗时从首个文本、思考或工具调用开始计算，不再把上游元数据计为首字。
+
+### 🌐 上游域名切换与 BuilderID 延迟优化
+
+> 来源：[PR #122](https://github.com/ZyphrZero/kiro.rs/pull/122)。提交人：[@XIUDENBENNY](https://github.com/XIUDENBENNY)，感谢贡献。
+
+- 新增 `apiDomain`：`amazonaws`（默认，`q.{region}.amazonaws.com`）或 `kiro`（`runtime.{region}.kiro.dev`，新版 Kiro IDE / CLI 使用的域名），作用于对话与 MCP（WebSearch）请求；Token 刷新、用量查询等 REST 接口不受影响。
+- 管理端「调度设置 → 上游域名」与 `GET` / `PUT /api/admin/config/api-domain` 可在运行时切换，立即生效并写回 `config.json`，写盘失败时回滚内存状态。
+- BuilderID 账号查询 profile 遇到「AWS Builder ID is not supported」403 时直接按无 Enterprise profile 处理，不再每次请求串行查询两个区域，降低首字延迟。
+- `web_search_tool_result` 补充 `tool_use_id`，兼容 Claude Code Desktop、AI SDK 等严格解析 Anthropic 格式的客户端。
+- 每个请求在日志中记录 thinking 类型、预算，以及客户端请求与实际发给上游的强度，便于核对 effort 设置。
+- 新增 `tools/kiro-tray`：Windows 系统托盘管理器，后台无窗口运行 kiro-rs，提供状态图标、崩溃自动重启、日志滚动与开机自启；用 Windows 自带的 `csc.exe` 编译，使用方法见 `tools/kiro-tray/README.md`。Release 产物暂不包含托盘程序，需要自行编译。
+
+### 📊 缓存计量与 WebSearch 费用
+
+> 来源：[PR #112](https://github.com/ZyphrZero/kiro.rs/pull/112) 与 [PR #115](https://github.com/ZyphrZero/kiro.rs/pull/115)，提交人：[@childe](https://github.com/childe)；[PR #116](https://github.com/ZyphrZero/kiro.rs/pull/116)，提交人：[@hyzhengdl](https://github.com/hyzhengdl)。感谢贡献。
+
+- 识别 OpenAI / Codex 形如 `session_<uuid>` 的会话标识（同时兼容 Claude Code 的 `..._session_<uuid>`），修复 Codex 请求退回 Key 粒度隔离、共享主 Key 时完全不模拟缓存的问题；JSON 中 `session_id` 为空时不再误判为会话。
+- Responses 请求在能解析出合法会话时启用模拟缓存计量，修复 Codex 经 `/v1/responses` 访问时缓存读写长期为 0。
+- WebSearch 多轮 agentic loop 逐轮计量缓存；最终响应的 `credit_usage` 改为所有轮次的累计费用，不再只返回最后一轮，与管理端统计一致。
+- 管理端缓存命中率改为 `cache_read / (input + cache_creation + cache_read)`，修复工具续轮时命中率被误显示为 100%。
+- 新增 `cacheMeteringCapacity`，默认容量从 `4096` 提高到 `262144`，修复共享部署在约 3.4 req/s 以上时缓存命中因容量不足而无声衰减；淘汰改为 O(n) 水位清理。容量选型公式见 README「计量容量选型」。
+- 新增 `cacheMeteringPersistEnabled`（默认 `false`）、`cacheMeteringFlushIntervalSecs`（默认 `300`）与 `cacheMeteringMissDiagnostics`（默认 `true`），以及 hit / miss 归因统计和对应的管理端接口。
+
+### 🔧 会话兼容与内容过滤
+
+> 来源：[PR #114](https://github.com/ZyphrZero/kiro.rs/pull/114)，提交人：[@ayakolin](https://github.com/ayakolin)；[PR #123](https://github.com/ZyphrZero/kiro.rs/pull/123)，提交人：[@beiqi7](https://github.com/beiqi7)。感谢贡献。
+
+- 历史中包含 Claude Code `Read` 调用的 `pages` 字段时不再返回 400（`工具映射不支持: Claude Code Read.pages has no Kiro read_file equivalent`）。该字段没有 Kiro `read_file` 对应项，且只出现在客户端无法修改的历史回放中，现改为丢弃。
+- 透传上游内容过滤拒答：Kiro 以 `metadataEvent.stopReason = CONTENT_FILTERED` 结束对话时，原先被当作正常的空回答（`end_turn`，或上下文用量满时的 `model_context_window_exceeded`），导致客户端反复重发同一段被拦截的历史。现在 `/v1/messages` 与 `/cc/v1/messages` 返回 `stop_reason: "refusal"`，Chat Completions 返回 `finish_reason: "content_filter"`，Responses 返回 `incomplete_details.reason: "content_filter"`，压缩请求返回 `content_filter` 失败，并在日志中记录上游类别与说明。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@childe](https://github.com/childe) | [#112](https://github.com/ZyphrZero/kiro.rs/pull/112)、[#115](https://github.com/ZyphrZero/kiro.rs/pull/115)、[#117](https://github.com/ZyphrZero/kiro.rs/pull/117) |
+| [@yeeyon](https://github.com/yeeyon) | [#110](https://github.com/ZyphrZero/kiro.rs/pull/110) |
+| [@ayakolin](https://github.com/ayakolin) | [#114](https://github.com/ZyphrZero/kiro.rs/pull/114) |
+| [@hyzhengdl](https://github.com/hyzhengdl) | [#116](https://github.com/ZyphrZero/kiro.rs/pull/116) |
+| [@XIUDENBENNY](https://github.com/XIUDENBENNY) | [#122](https://github.com/ZyphrZero/kiro.rs/pull/122) |
+| [@beiqi7](https://github.com/beiqi7) | [#123](https://github.com/ZyphrZero/kiro.rs/pull/123) |
+
+以上按 GitHub PR 作者列出。
+
+### 🤝 Collaborators — PR 合并与维护
+
+- [@childe](https://github.com/childe)：合并 PR #110、#112、#114–#117，协助整合社区改动。
+- [@ZyphrZero](https://github.com/ZyphrZero)：合并 PR #122 与 #123。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.2`，无需手动转换现有配置、凭据、客户端 Key 或日志数据库。
+- `apiDomain` 默认 `amazonaws`，保持原有上游域名；`upstreamTotalTimeoutSecs` 默认 `720`，与原来写死的值一致。
+- `cacheMeteringPersistEnabled` 默认 `false`：升级后默认不再读写 `cache_metering.json`，重启后模拟缓存从空开始；需要保留时显式设为 `true`。
+- 默认计量容量提高到 `262144`，内存占用约 16–24 MB；内存受限的部署可通过 `cacheMeteringCapacity` 调小。
+- 模型过载现在会立即返回 503 与 `Retry-After`，不再隐藏在三次内部重试之后：客户端等待更短，但可能更早看到失败，请按 `Retry-After` 重试。
+
+完整变更：[v0.9.1...v0.9.2](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.1...v0.9.2)。
 
 ## [0.9.1] - 2026-10-08
 

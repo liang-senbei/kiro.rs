@@ -30,7 +30,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::session_affinity::{RouteDecision, SessionAffinity, StickyOutcome};
-use crate::model::config::Config;
+use crate::model::config::{ApiDomain, Config};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -471,6 +471,10 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
+fn is_builder_id_unsupported(status: u16, body: &str) -> bool {
+    status == 403 && body.contains("AWS Builder ID is not supported")
+}
+
 fn profile_arn_query(profile_arn: Option<&str>) -> String {
     match profile_arn {
         Some(arn) => format!("&profileArn={}", urlencoding::encode(arn)),
@@ -833,6 +837,12 @@ pub(crate) async fn list_available_profiles(
         let body_text = response.text().await.unwrap_or_default();
         if let Some(error) = rate_limit_error {
             return Err(error.into());
+        }
+        // BuilderID 账号上游固定 403 拒绝该操作：属于确定结果（无 Enterprise profile），
+        // 另一区域也会同样拒绝，直接按"无 profile"处理，避免每个请求都重查两次。
+        if is_builder_id_unsupported(status.as_u16(), &body_text) {
+            empty_seen = true;
+            break;
         }
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
@@ -1232,6 +1242,8 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 对话 / MCP 上游域名（运行时可修改）
+    api_domain: Mutex<ApiDomain>,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
     session_affinity: SessionAffinity,
     /// 账号级 429 限流故障转移开关（运行时可修改）
@@ -1476,6 +1488,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let api_domain = config.api_domain;
         let session_affinity = SessionAffinity::new(
             config.session_affinity_enabled,
             config.session_affinity_ttl_secs,
@@ -1503,6 +1516,7 @@ impl MultiTokenManager {
             runtime_config_update_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            api_domain: Mutex::new(api_domain),
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
@@ -4556,6 +4570,27 @@ impl MultiTokenManager {
         self.load_balancing_mode.lock().clone()
     }
 
+    /// 当前对话 / MCP 上游域名
+    pub fn api_domain(&self) -> ApiDomain {
+        *self.api_domain.lock()
+    }
+
+    /// 设置对话 / MCP 上游域名（运行时生效 + 持久化 config.json，持久化失败则回滚）
+    pub fn set_api_domain(&self, domain: ApiDomain) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+        let previous = self.api_domain();
+        if previous == domain {
+            return Ok(());
+        }
+        *self.api_domain.lock() = domain;
+        if let Err(err) = self.update_config_file(move |config| config.api_domain = domain) {
+            *self.api_domain.lock() = previous;
+            return Err(err);
+        }
+        tracing::info!("上游域名已设置为: {:?}", domain);
+        Ok(())
+    }
+
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         let mode = mode.to_string();
         self.update_config_file(move |config| config.load_balancing_mode = mode)
@@ -6146,6 +6181,124 @@ mod tests {
     }
 
     #[test]
+    fn api_domain_update_persists_and_survives_restart() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-api-domain-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &config_path,
+            r#"{"apiDomain":"amazonaws","region":"eu-central-1"}"#,
+        )
+        .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::load(&config_path).unwrap(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        for domain in [ApiDomain::Kiro, ApiDomain::Amazonaws, ApiDomain::Kiro] {
+            manager.set_api_domain(domain).unwrap();
+            assert_eq!(manager.api_domain(), domain);
+            let persisted = Config::load(&config_path).unwrap();
+            assert_eq!(persisted.api_domain, domain);
+            assert_eq!(persisted.region, "eu-central-1");
+        }
+        let restarted = MultiTokenManager::new(
+            Config::load(&config_path).unwrap(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(restarted.api_domain(), ApiDomain::Kiro);
+        std::fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn api_domain_update_rolls_back_on_config_reload_and_write_errors() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-api-domain-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, "{}").unwrap();
+        let manager = MultiTokenManager::new(
+            Config::load(&config_path).unwrap(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        std::fs::write(&config_path, "invalid json").unwrap();
+        assert!(manager.set_api_domain(ApiDomain::Kiro).is_err());
+        assert_eq!(manager.api_domain(), ApiDomain::Amazonaws);
+        std::fs::write(&config_path, "{}").unwrap();
+        #[cfg(windows)]
+        {
+            let permissions = std::fs::metadata(&config_path).unwrap().permissions();
+            let mut readonly_permissions = permissions.clone();
+            readonly_permissions.set_readonly(true);
+            std::fs::set_permissions(&config_path, readonly_permissions).unwrap();
+            let result = manager.set_api_domain(ApiDomain::Kiro);
+            std::fs::set_permissions(&config_path, permissions).unwrap();
+            assert!(result.is_err());
+            assert_eq!(manager.api_domain(), ApiDomain::Amazonaws);
+            assert_eq!(
+                Config::load(&config_path).unwrap().api_domain,
+                ApiDomain::Amazonaws
+            );
+        }
+        std::fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn api_domain_concurrent_update_cannot_acknowledge_a_rolled_back_value() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-api-domain-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, "{}").unwrap();
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::load(&config_path).unwrap(),
+                vec![KiroCredentials::default()],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        std::fs::write(&config_path, "invalid json").unwrap();
+        let file_guard = manager.config_write_lock.lock();
+        let first_manager = manager.clone();
+        let first = std::thread::spawn(move || first_manager.set_api_domain(ApiDomain::Kiro));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.api_domain() != ApiDomain::Kiro && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let second_manager = manager.clone();
+        let second = std::thread::spawn(move || {
+            sender
+                .send(second_manager.set_api_domain(ApiDomain::Kiro))
+                .unwrap();
+        });
+        let early_result = receiver
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok();
+        drop(file_guard);
+        let first_result = first.join().unwrap();
+        second.join().unwrap();
+        let second_result = early_result.unwrap_or_else(|| receiver.recv().unwrap());
+        let actual = manager.api_domain();
+        std::fs::remove_file(config_path).unwrap();
+        assert!(first_result.is_err());
+        assert!(
+            second_result.is_err(),
+            "a concurrent caller acknowledged a domain that was rolled back"
+        );
+        assert_eq!(actual, ApiDomain::Amazonaws);
+    }
+
+    #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
         let config_path =
             std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
@@ -6641,6 +6794,14 @@ mod tests {
                 ("eu-central-1", None),
             ]
         );
+    }
+
+    #[test]
+    fn test_builder_id_unsupported_is_definitive() {
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"AWS Builder ID is not supported for this operation."}"#;
+        assert!(is_builder_id_unsupported(403, body));
+        assert!(!is_builder_id_unsupported(403, r#"{"message":"Invalid token"}"#));
+        assert!(!is_builder_id_unsupported(500, body));
     }
 
     #[test]
