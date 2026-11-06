@@ -247,8 +247,17 @@ export const CC_SWITCH_USAGE_SCRIPT = `({
 /** CC Switch 自动查询用量的间隔（分钟）；《用量接口 v1》要求自动刷新不快于 5 分钟一次 */
 const CC_SWITCH_USAGE_INTERVAL_MINUTES = 10
 
+/** CC Switch 只对 HTTPS 地址运行用量查询脚本；http 地址导入后卡片不会显示余额 */
+export function ccSwitchUsageSupported(target: ExportTarget): boolean {
+  try {
+    return new URL(normalizeBaseUrl(target.baseUrl)).protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
 /**
- * CC Switch 一键导入链接：Claude Code 供应商，Anthropic 原生格式，带用量查询脚本。
+ * CC Switch 一键导入链接：Claude Code 供应商，Anthropic 原生格式；HTTPS 地址带用量查询脚本。
  *
  * 链接含明文 Key，等同 Key 本身；只在用户点击时生成，不写进页面源码。
  */
@@ -260,11 +269,13 @@ export function ccSwitchImportLink(target: ExportTarget, providerName: string): 
     endpoint: anthropicBaseUrl(target),
     apiKey: target.apiKey,
     apiFormat: 'anthropic',
-    usageScript: base64Utf8(CC_SWITCH_USAGE_SCRIPT),
-    // v4.0.10 前的版本带了脚本也默认不启用，显式写上
-    usageEnabled: 'true',
-    usageAutoInterval: String(CC_SWITCH_USAGE_INTERVAL_MINUTES),
   })
+  if (ccSwitchUsageSupported(target)) {
+    params.set('usageScript', base64Utf8(CC_SWITCH_USAGE_SCRIPT))
+    // v4.0.10 前的版本带了脚本也默认不启用，显式写上
+    params.set('usageEnabled', 'true')
+    params.set('usageAutoInterval', String(CC_SWITCH_USAGE_INTERVAL_MINUTES))
+  }
   // 模型槽位走 CC Switch 的专用参数（写成同名 ANTHROPIC_* 变量），其余变量放进 Base64 的 config.env
   const extraEnv: Record<string, string> = {}
   for (const [key, value] of Object.entries(target.modelEnv ?? {})) {

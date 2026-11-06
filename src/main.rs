@@ -347,8 +347,13 @@ async fn main() {
         });
     }
 
-    // 各账号最近查到的余额：Admin 服务写，`/v1/usage` 读
-    let balance_board: admin::balance_board::SharedBalanceBoard = Default::default();
+    // 各账号最近查到的余额：Admin 服务写，`/v1/usage` 读。余额后台刷新随 Admin 服务启动，
+    // 未启用 Admin API 时没有这张表，`/v1/usage` 不返回池子
+    let balance_board: Option<admin::balance_board::SharedBalanceBoard> = config
+        .admin_api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+        .then(Default::default);
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
@@ -359,7 +364,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
-        Some(balance_board.clone()),
+        balance_board.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -375,15 +380,17 @@ async fn main() {
                     admin::TraceStore::open_in_memory().expect("内存 trace store 初始化失败"),
                 )
             });
-            let admin_service =
+            let mut admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
                     .with_kiro_provider(kiro_provider.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
                     )
-                    .with_cache_meter(cache_meter.clone())
-                    .with_balance_board(balance_board.clone());
+                    .with_cache_meter(cache_meter.clone());
+            if let Some(board) = &balance_board {
+                admin_service = admin_service.with_balance_board(board.clone());
+            }
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

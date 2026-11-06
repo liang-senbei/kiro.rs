@@ -130,10 +130,15 @@ pub async fn get_key_usage(State(state): State<AppState>, request: Request<Body>
         );
     };
 
+    let now = Utc::now();
     let pool = if key.pool_visible {
-        match visible_pool(&state, key.group.as_deref()) {
-            Some(pool) => Some(pool),
-            None => {
+        match visible_pool(&state, key.group.as_deref(), now) {
+            PoolLookup::Known(pool) => Some(pool),
+            // 没有余额表（未启用 Admin API）：只回这把 Key 自己的数
+            PoolLookup::Unsupported => None,
+            // 规范：从来没查到过回 503。但 Key 自己限额、停用或用完时，Key 的状态和额度
+            // 照样有意义，回 200 不带 pool；只有不限额的正常 Key（能显示的只有池子）才回 503
+            PoolLookup::NotYetKnown if pool_is_all_there_is(&key) => {
                 let mut resp = error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "pool_unavailable",
@@ -145,12 +150,28 @@ pub async fn get_key_usage(State(state): State<AppState>, request: Request<Body>
                 );
                 return resp;
             }
+            PoolLookup::NotYetKnown => None,
         }
     } else {
         None
     };
 
-    json_response(StatusCode::OK, &usage_response(&key, pool, Utc::now()))
+    json_response(StatusCode::OK, &usage_response(&key, pool, now))
+}
+
+/// 不限额、未停用、未用完：回包里唯一有用的数就是池子
+fn pool_is_all_there_is(key: &ClientKey) -> bool {
+    key.max_credits.is_none() && !key.disabled
+}
+
+/// 查池子的结果
+#[derive(Debug, PartialEq)]
+pub enum PoolLookup {
+    Known(PoolBlock),
+    /// 有账号，但一份余额都还没查到过
+    NotYetKnown,
+    /// 这个实例没有余额表（未启用 Admin API，余额后台刷新不运行）
+    Unsupported,
 }
 
 /// 池子里的一个账号
@@ -161,10 +182,11 @@ pub struct PoolMember {
     pub quota_exhausted: bool,
 }
 
-/// 这把 Key 能用的账号的余额之和；从来没查到过余额时为 None
-fn visible_pool(state: &AppState, group: Option<&str>) -> Option<PoolBlock> {
-    let provider = state.kiro_provider.as_ref()?;
-    let board = state.balance_board.as_ref()?;
+/// 这把 Key 能用的账号的余额之和
+fn visible_pool(state: &AppState, group: Option<&str>, now: DateTime<Utc>) -> PoolLookup {
+    let (Some(provider), Some(board)) = (&state.kiro_provider, &state.balance_board) else {
+        return PoolLookup::Unsupported;
+    };
     // 分组规则与调度一致：Key 不绑分组时算全部账号。
     // 手动停用、失效的账号不算；额度用完被停用的算，剩余记 0
     let members: Vec<PoolMember> = provider
@@ -182,7 +204,10 @@ fn visible_pool(state: &AppState, group: Option<&str>) -> Option<PoolBlock> {
             })
         })
         .collect();
-    pool_balance(&members, &board.snapshot())
+    match pool_balance(&members, &board.snapshot(), now) {
+        Some(pool) => PoolLookup::Known(pool),
+        None => PoolLookup::NotYetKnown,
+    }
 }
 
 pub fn usage_response(
@@ -266,7 +291,11 @@ pub fn usage_response(
 /// 汇总这些账号的余额。
 ///
 /// 一个账号都没有时池子就是 0；有账号但一份余额都没查到过时返回 None（回 503）。
-pub fn pool_balance(members: &[PoolMember], board: &HashMap<u64, BoardEntry>) -> Option<PoolBlock> {
+pub fn pool_balance(
+    members: &[PoolMember],
+    board: &HashMap<u64, BoardEntry>,
+    now: DateTime<Utc>,
+) -> Option<PoolBlock> {
     let balances: Vec<(&BoardEntry, bool)> = members
         .iter()
         .filter_map(|m| board.get(&m.id).map(|b| (b, m.quota_exhausted)))
@@ -285,13 +314,18 @@ pub fn pool_balance(members: &[PoolMember], board: &HashMap<u64, BoardEntry>) ->
             remaining += b.remaining.max(0.0);
         }
     }
+    // 已经过去的重置时间是旧缓存留下的（下一次重置还没查到），不能拿来显示
+    let now_secs = now.timestamp() as f64;
     let resets_at = balances
         .iter()
         .filter_map(|(b, _)| b.next_reset_at)
+        .filter(|t| *t > now_secs)
         .min_by(f64::total_cmp)
         .and_then(unix_to_iso_z);
+    // 只按真正用到缓存数的账号算：额度用完的账号剩余按当前停用状态记 0，不看它的旧缓存
     let updated_at = balances
         .iter()
+        .filter(|(_, quota_exhausted)| !quota_exhausted)
         .map(|(b, _)| b.cached_at)
         .min_by(f64::total_cmp)
         .and_then(unix_to_iso_z);
@@ -509,7 +543,7 @@ mod tests {
             (4, entry(300.0, 500.0, 1_796_000_000.0, 1_793_900_000.0)),
         ]);
         // 5 还没查到余额：按已查到的算
-        let pool = pool_balance(&[m(1), m(2), m(5)], &board).unwrap();
+        let pool = pool_balance(&[m(1), m(2), m(5)], &board, now()).unwrap();
         assert_eq!(pool.remaining, 1540.0);
         assert_eq!(pool.limit, 2050.0);
         assert_eq!(pool.used, 510.0);
@@ -519,16 +553,16 @@ mod tests {
 
     #[test]
     fn pool_is_unavailable_until_any_balance_is_known() {
-        assert_eq!(pool_balance(&[m(1)], &HashMap::new()), None);
+        assert_eq!(pool_balance(&[m(1)], &HashMap::new(), now()), None);
         // 一个账号都没有：池子就是 0
-        let empty = pool_balance(&[], &HashMap::new()).unwrap();
+        let empty = pool_balance(&[], &HashMap::new(), now()).unwrap();
         assert_eq!((empty.limit, empty.used, empty.remaining), (0.0, 0.0, 0.0));
     }
 
     #[test]
     fn negative_remaining_counts_as_zero() {
         let board = HashMap::from([(1, entry(-3.0, 50.0, 1.0, 1.0))]);
-        assert_eq!(pool_balance(&[m(1)], &board).unwrap().remaining, 0.0);
+        assert_eq!(pool_balance(&[m(1)], &board, now()).unwrap().remaining, 0.0);
     }
 
     #[test]
@@ -542,11 +576,40 @@ mod tests {
             id: 1,
             quota_exhausted: true,
         };
-        let pool = pool_balance(&[exhausted, m(2)], &board).unwrap();
+        let pool = pool_balance(&[exhausted, m(2)], &board, now()).unwrap();
         assert_eq!(pool.limit, 100.0);
         assert_eq!(pool.used, 70.0);
         assert_eq!(pool.remaining, 30.0);
         assert_eq!(pool.resets_at.as_deref(), Some("2026-11-18T11:06:40Z"));
+    }
+
+    #[test]
+    fn stale_reset_and_exhausted_cache_times_are_not_reported() {
+        // #1：10 月 20 日查的、11 月 1 日重置，之后额度用完被停用；#2：刚查过、12 月 1 日重置
+        let board = HashMap::from([
+            (1, entry(0.0, 50.0, 1_793_491_200.0, 1_792_454_400.0)),
+            (2, entry(30.0, 50.0, 1_796_083_200.0, 1_794_014_400.0)),
+        ]);
+        let exhausted = PoolMember {
+            id: 1,
+            quota_exhausted: true,
+        };
+        let pool = pool_balance(&[exhausted, m(2)], &board, now()).unwrap();
+        assert_eq!(pool.resets_at.as_deref(), Some("2026-12-01T00:00:00Z"));
+        assert_eq!(pool.updated_at.as_deref(), Some("2026-11-07T01:20:00Z"));
+
+        // 只剩用完的账号：重置时间已过、缓存时间也不作数，两项都不给
+        let only = pool_balance(&[exhausted], &board, now()).unwrap();
+        assert_eq!(only.resets_at, None);
+        assert_eq!(only.updated_at, None);
+        assert_eq!(only.remaining, 0.0);
+    }
+
+    #[test]
+    fn only_unlimited_active_keys_need_the_pool() {
+        assert!(pool_is_all_there_is(&key(1.0, None, false)));
+        assert!(!pool_is_all_there_is(&key(1.0, Some(10.0), false)));
+        assert!(!pool_is_all_there_is(&key(1.0, None, true)));
     }
 
     #[test]

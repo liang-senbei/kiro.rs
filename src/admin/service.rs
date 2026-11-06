@@ -1727,6 +1727,9 @@ impl AdminService {
 
         // 清理已删除凭据的余额缓存
         self.invalidate_balance_cache(id);
+        if let Some(board) = &self.balance_board {
+            board.forget(id);
+        }
 
         if let Some(trace_store) = &self.trace_store {
             trace_store.delete_for_credential(id);
@@ -2931,7 +2934,7 @@ impl AdminService {
         self.save_balance_cache();
     }
 
-    /// 把余额缓存同步给 `/v1/usage`，并在启用时立即同步一次
+    /// 把余额缓存同步给 `/v1/usage`，并在启用时立即同步一次（含重启前落盘的余额）
     pub fn with_balance_board(mut self, board: super::balance_board::SharedBalanceBoard) -> Self {
         self.balance_board = Some(board);
         self.publish_balance_board();
@@ -2959,7 +2962,7 @@ impl AdminService {
                 )
             })
             .collect();
-        board.replace_all(entries);
+        board.merge(entries);
     }
 
     fn save_balance_cache(&self) {

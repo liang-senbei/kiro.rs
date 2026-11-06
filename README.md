@@ -838,7 +838,7 @@ JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退
 - **直接使用**：给出 Claude Code 的 `~/.claude/settings.json` 片段、macOS / Linux 与 PowerShell 的环境变量、连通性测试 `curl`，以及 Anthropic / OpenAI 兼容客户端的 base URL。连接只设置 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，不设置 `ANTHROPIC_API_KEY`（两者同时存在时 Claude Code 会提示凭证冲突）；选了模型时再加 `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`。
 - **CC Switch 导入**：一键唤起 [CC Switch](https://ccswitch.io)，导入为 Claude Code 供应商，接口格式 Anthropic 原生（`apiFormat=anthropic`），Claude Code 直连本服务，不需要 CC Switch 本地路由。链接形如 `ccswitch://v1/import?resource=provider&app=claude&name=…&endpoint=…&apiKey=…&apiFormat=anthropic`，选了模型时带上 `model` / `opusModel` / `sonnetModel` / `haikuModel`，`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 放在 Base64 的 `config` 里（CC Switch v3.16.0 起才保留这类变量）；没选模型则沿用 Claude Code 自带的模型列表。也可以复制链接发给 Key 的使用者自己点开。建议 CC Switch v4.0.10 及以上。
 
-CC Switch 导入链接同时带上用量查询脚本（`usageScript`，`usageEnabled=true`，每 10 分钟自动查一次），导入后供应商卡片直接显示剩余积分，见下一节。「直接使用」页也有一条查余额的 `curl`。
+服务地址是 `https://` 时，CC Switch 导入链接同时带上用量查询脚本（`usageScript`，`usageEnabled=true`，每 10 分钟自动查一次），导入后供应商卡片直接显示剩余积分，见下一节；CC Switch 不对 http 地址查用量，这时链接里不带脚本。「直接使用」页也有一条查余额的 `curl`。
 
 导出时 Admin UI 通过 `POST /api/admin/client-keys/{id}/export` 取回明文 Key（响应带 `Cache-Control: no-store`）。导入链接和配置片段都带着明文 Key，只发给这把 Key 的使用者。
 
@@ -867,7 +867,9 @@ curl https://kiro.example.com/v1/usage -H 'Authorization: Bearer sk-…'
 ```
 
 - `key`：这把 Key 自己的积分。没设积分上限时不给 `limit` 和 `remaining`。
-- `pool`：这把 Key 能用的 Kiro 账号（按它绑定的分组，未绑定就是全部账号）还剩多少积分，取自后台每 5 分钟刷新一次的账号余额，`updatedAt` 是其中最旧那份的时间。手动停用的账号不算；额度用完被停用的算在 `limit` 里，剩余记 0。**只有在「编辑 Key」里打开了「查用量时能看池子」的 Key 才带 `pool`**，默认关：Key 发给别人时，对方看不到池子大小。打开了但一个账号的余额都还没查到时回 503 + `Retry-After`。
+- `pool`：这把 Key 能用的 Kiro 账号（按它绑定的分组，未绑定就是全部账号）还剩多少积分，取自后台每 5 分钟刷新一次的账号余额（刷新失败时用上次查到的数），`updatedAt` 是其中最旧那份的时间，`resetsAt` 是最早的下次重置时间（已经过去的不算）。手动停用的账号不算；额度用完被停用的算在 `limit` 里，剩余记 0。**只有在「编辑 Key」里打开了「查用量时能看池子」的 Key 才带 `pool`**，默认关：Key 发给别人时，对方看不到池子大小。
+  - 打开了、但池子里一个账号的余额都还没查到过：不限额的 Key 回 503 + `Retry-After`（能显示的只有池子）；Key 自己限额、停用或用完时照样回 200，只是不带 `pool`。
+  - 余额后台刷新随 Admin 服务运行，没配 `adminApiKey` 的实例不返回 `pool`。
 - `isValid` / `status` / `planName` / `remaining` / `unit` / `quota` 是给 CC Switch「Sub2API」用量模板读的：Key 设了上限时是 Key 的数；没设上限、又能看池子时是池子的数；都没有就不给 `remaining` 和 `quota`。
 - 数字最多两位小数，时间都是 UTC、以 `Z` 结尾。
 

@@ -13,7 +13,7 @@ import { exportClientKey, getClientKeyModels } from '@/api/client-keys'
 import { getCurrentCredentialModels, getCustomModels } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import {
-  anthropicBaseUrl, ccSwitchImportLink, claudeCodeModelEnv, claudeCodeSettingsJson, curlTest, usageCurl,
+  anthropicBaseUrl, ccSwitchImportLink, ccSwitchUsageSupported, claudeCodeModelEnv, claudeCodeSettingsJson, curlTest, usageCurl,
   hasExtraModelEnv, isLocalAddress, maskSecret, normalizeBaseUrl, openAiBaseUrl, powershellExports, shellExports,
   type ExportEndpointMode, type ExportModel, type ExportModelSlots, type ExportTarget,
 } from '@/lib/client-key-export'
@@ -486,10 +486,16 @@ export function ClientKeyExportDialog({
                   </Button>
                 </div>
                 <div className="space-y-1 text-[11px] text-muted-foreground">
-                  <p>
-                    导入后卡片上会显示剩余积分（每 10 分钟自动查一次 <code>/v1/usage</code>，不计调用次数）：
-                    Key 设了积分上限就显示这把 Key 还剩多少；在「编辑 Key」里打开「查用量时能看池子」的，再多一行池子剩余。
-                  </p>
+                  {ccSwitchUsageSupported(target) ? (
+                    <p>
+                      导入后卡片上会显示剩余积分（每 10 分钟自动查一次 <code>/v1/usage</code>，不计调用次数）：
+                      Key 设了积分上限就显示这把 Key 还剩多少；在「编辑 Key」里打开「查用量时能看池子」的，再多一行池子剩余。
+                    </p>
+                  ) : (
+                    <p className="text-amber-600 dark:text-amber-400">
+                      服务地址不是 <code>https://</code>：CC Switch 只对 HTTPS 地址查用量，导入链接里不带用量查询，卡片不会显示余额。
+                    </p>
+                  )}
                   <p>
                     浏览器会先询问是否打开 CC Switch，选「打开」，在 CC Switch 的确认框里核对后点「导入」。
                     确认框底部的「导入后立即切换」决定是否马上用它。点了没反应？可能还没安装，先
