@@ -11,8 +11,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 ### 💰 用 Key 查剩余额度（`GET /v1/usage`）
 
 - 新增 `GET /v1/usage` 和 `/cc/v1/usage`：客户端用调模型的同一把 Key（`Authorization: Bearer` 或 `x-api-key`）查这把 Key 的已用、上限和剩余积分。查询不计调用次数、不占额度；Key 停用或用完时也回 200，用 `state` 说明；Key 不存在回 401。回包格式见 README「查剩余额度」，顶层几项兼容 CC Switch 的 Sub2API 用量模板。
-- 客户端 Key 新增「查用量时能看池子」开关（默认关，`POST /api/admin/client-keys/{id}/pool-visible`，在「编辑 Key」里设置，列表里标「看池子」）。打开的 Key 回包里多一块 `pool`：它能用的 Kiro 账号剩余积分之和，来自后台每 5 分钟刷新的余额；作废某个账号的余额缓存（如切换超额）时池子沿用它上次查到的数，不会变小。没打开的 Key 回包里没有任何池子的数。
+- 客户端 Key 新增「查用量时能看池子」开关（默认关，`POST /api/admin/client-keys/{id}/pool-visible`，在「编辑 Key」里设置，列表里标「看池子」）。打开的 Key 回包里多一块 `pool`：它能用的 Kiro 账号剩余积分之和，来自后台每 5 分钟刷新的余额；作废某个账号的余额缓存（如切换超额）或重启后，池子沿用它上次查到的数（单独存在 `kiro_pool_balance.json`），不会变小；额度用完被停用的账号剩余按 0 算。没打开的 Key 回包里没有任何池子的数。
 - 池子余额一份都还没查到时，只有不限额的 Key 回 503；限额、停用、用完的 Key 照样回 200，不带 `pool`。没配 `adminApiKey`（没有余额后台刷新）的实例不返回 `pool`。
+- README 加了只公开 `/v1`、`/cc/v1` 的 nginx 写法，含按原始路径校验（防 `/admin/%2e%2e/v1/` 这类路径绕到管理后台）。
 - CC Switch 导入链接（服务地址为 `https://` 时）带上用量查询脚本，导入后卡片显示剩余积分（每 10 分钟自动查一次）；「直接使用」页加了查余额的 `curl`。
 
 ### 🔀 合并 upstream v0.9.2（ZyphrZero/kiro.rs master @ `711c3e6`）

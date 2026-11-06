@@ -2936,6 +2936,10 @@ impl AdminService {
 
     /// 把余额缓存同步给 `/v1/usage`，并在启用时立即同步一次（含重启前落盘的余额）
     pub fn with_balance_board(mut self, board: super::balance_board::SharedBalanceBoard) -> Self {
+        // 池子余额单独落盘：Admin 缓存作废的条目，重启后也还能从这里拿到上次的数
+        if let Some(path) = &self.cache_path {
+            board.attach_file(path.with_file_name("kiro_pool_balance.json"));
+        }
         self.balance_board = Some(board);
         self.publish_balance_board();
         self
@@ -2945,24 +2949,20 @@ impl AdminService {
         let Some(board) = &self.balance_board else {
             return;
         };
-        let entries = self
-            .balance_cache
-            .lock()
-            .iter()
-            .map(|(id, cached)| {
-                (
-                    *id,
-                    super::balance_board::BoardEntry {
-                        remaining: cached.data.remaining,
-                        usage_limit: cached.data.usage_limit,
-                        current_usage: cached.data.current_usage,
-                        next_reset_at: cached.data.next_reset_at,
-                        cached_at: cached.cached_at,
-                    },
-                )
-            })
-            .collect();
-        board.merge(entries);
+        // 持有缓存锁更新，多个改动按先后应用（后来的快照一定覆盖先前的）
+        let cache = self.balance_cache.lock();
+        board.publish(cache.iter().map(|(id, cached)| {
+            (
+                *id,
+                super::balance_board::BoardEntry {
+                    remaining: cached.data.remaining,
+                    usage_limit: cached.data.usage_limit,
+                    current_usage: cached.data.current_usage,
+                    next_reset_at: cached.data.next_reset_at,
+                    cached_at: cached.cached_at,
+                },
+            )
+        }));
     }
 
     fn save_balance_cache(&self) {

@@ -290,19 +290,25 @@ pub fn usage_response(
 
 /// 汇总这些账号的余额。
 ///
-/// 一个账号都没有时池子就是 0；有账号但一份余额都没查到过时返回 None（回 503）。
+/// 返回 None 表示还不知道：有没用完的账号，但它们一份余额都没查到过（回包时见 [`PoolLookup`]）。
+/// 额度用完的账号剩余按 0 算，不需要查到余额；查到过的话 `limit` / `used` 也算上。
+/// 一个账号都没有时池子就是 0。
 pub fn pool_balance(
     members: &[PoolMember],
     board: &HashMap<u64, BoardEntry>,
     now: DateTime<Utc>,
 ) -> Option<PoolBlock> {
+    let has_active = members.iter().any(|m| !m.quota_exhausted);
+    let active_known = members
+        .iter()
+        .any(|m| !m.quota_exhausted && board.contains_key(&m.id));
+    if has_active && !active_known {
+        return None;
+    }
     let balances: Vec<(&BoardEntry, bool)> = members
         .iter()
         .filter_map(|m| board.get(&m.id).map(|b| (b, m.quota_exhausted)))
         .collect();
-    if balances.is_empty() && !members.is_empty() {
-        return None;
-    }
     let (mut limit, mut used, mut remaining) = (0.0, 0.0, 0.0);
     for (b, quota_exhausted) in &balances {
         limit += b.usage_limit;
@@ -557,6 +563,20 @@ mod tests {
         // 一个账号都没有：池子就是 0
         let empty = pool_balance(&[], &HashMap::new(), now()).unwrap();
         assert_eq!((empty.limit, empty.used, empty.remaining), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn exhausted_accounts_are_known_without_a_balance() {
+        let exhausted = PoolMember {
+            id: 1,
+            quota_exhausted: true,
+        };
+        // 只有用完的账号、且没查到过余额（缓存被作废后重启）：剩余就是 0，不是「查不到」
+        let pool = pool_balance(&[exhausted], &HashMap::new(), now()).unwrap();
+        assert_eq!((pool.limit, pool.used, pool.remaining), (0.0, 0.0, 0.0));
+        // 还有没用完、也没查到过的账号：剩余确实不知道
+        let board = HashMap::from([(1, entry(0.0, 50.0, 1.0, 1.0))]);
+        assert_eq!(pool_balance(&[exhausted, m(2)], &board, now()), None);
     }
 
     #[test]

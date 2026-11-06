@@ -872,6 +872,31 @@ curl https://kiro.example.com/v1/usage -H 'Authorization: Bearer sk-…'
   - 余额后台刷新随 Admin 服务运行，没配 `adminApiKey` 的实例不返回 `pool`。
 - `isValid` / `status` / `planName` / `remaining` / `unit` / `quota` 是给 CC Switch「Sub2API」用量模板读的：Key 设了上限时是 Key 的数；没设上限、又能看池子时是池子的数；都没有就不给 `remaining` 和 `quota`。
 - 数字最多两位小数，时间都是 UTC、以 `Z` 结尾。
+- 池子余额除了 Admin 的余额缓存，还单独存在 `kiro_pool_balance.json`（和 `kiro_balance_cache.json` 同目录）：Admin 作废某个账号的缓存（切换超额、重新登录）或服务重启后，池子仍用这个账号上次查到的数，凭据删除时才移除。
+
+### 对外提供 API 时的反向代理
+
+只想公开 API、不公开管理后台时，反向代理只放 `/v1/` 和 `/cc/v1/`。注意 nginx 的 `location` 按解码、去掉 `./..` 之后的路径匹配，`proxy_pass`（不带 URI 时）却原样转发客户端发来的路径：`/admin/%2e%2e/v1/` 在 nginx 看来是 `/v1/`，到了 kiro-rs 却落进 `/admin`。所以要再按原始路径 `$request_uri` 校验一遍：
+
+```nginx
+location ~ ^/(cc/)?v1/ {
+    if ($request_uri !~ "^/(cc/)?v1/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*(\?.*)?$") {
+        return 404;
+    }
+    proxy_pass http://127.0.0.1:8990;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;            # SSE 流式
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    client_max_body_size 50m;       # 与 kiro-rs 的请求体上限一致
+}
+location / {
+    return 404;
+}
+```
+
+管理后台通过 SSH 隧道或内网访问。
 
 Admin 还提供：
 
