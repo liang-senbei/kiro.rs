@@ -6,6 +6,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
@@ -15,7 +16,7 @@ import {
 import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
-  useRotateClientKey, useSetClientKeyMaxCredits,
+  useRotateClientKey, useSetClientKeyMaxCredits, useSetClientKeyPoolVisible,
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
@@ -89,6 +90,7 @@ export function ClientKeysPage() {
   const updateKey = useUpdateClientKey()
   const rotateKey = useRotateClientKey()
   const setMaxCredits = useSetClientKeyMaxCredits()
+  const setPoolVisible = useSetClientKeyPoolVisible()
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
@@ -106,6 +108,7 @@ export function ClientKeysPage() {
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
   const [editMaxCredits, setEditMaxCredits] = useState('')
+  const [editPoolVisible, setEditPoolVisible] = useState(false)
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -214,6 +217,7 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
+    setEditPoolVisible(item.poolVisible)
     setEditOpen(true)
   }
 
@@ -234,6 +238,9 @@ export function ClientKeysPage() {
       const prev = editTarget.maxCredits ?? null
       if (maxCredits !== prev) {
         await setMaxCredits.mutateAsync({ id: editTarget.id, maxCredits })
+      }
+      if (editPoolVisible !== editTarget.poolVisible) {
+        await setPoolVisible.mutateAsync({ id: editTarget.id, poolVisible: editPoolVisible })
       }
       toast.success('已更新')
       setEditOpen(false)
@@ -404,12 +411,18 @@ export function ClientKeysPage() {
       {
         id: 'status',
         header: '状态',
-        cell: (k) =>
-          k.disabled ? (
-            <Badge variant="destructive">已禁用</Badge>
-          ) : (
-            <Badge variant="success">启用</Badge>
-          ),
+        cell: (k) => (
+          <span className="inline-flex items-center gap-1">
+            {k.disabled ? (
+              <Badge variant="destructive">已禁用</Badge>
+            ) : (
+              <Badge variant="success">启用</Badge>
+            )}
+            {k.poolVisible && (
+              <Badge variant="outline" title="用这把 Key 查用量时能看到池子剩余积分">看池子</Badge>
+            )}
+          </span>
+        ),
       },
       {
         id: 'totalCalls',
@@ -798,10 +811,27 @@ export function ClientKeysPage() {
                   累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
                 </p>
               </div>
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <label htmlFor="edit-pool-visible" className="text-[12px] text-muted-foreground">
+                    查用量时能看池子
+                  </label>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    打开后，用这把 Key 查 /v1/usage 会多返回池子（它能用的 Kiro 账号）还剩多少积分。
+                    Key 发给别人时别开，开了对方就能看到池子总量。
+                  </p>
+                </div>
+                <Switch
+                  id="edit-pool-visible"
+                  checked={editPoolVisible}
+                  onCheckedChange={setEditPoolVisible}
+                  disabled={updateKey.isPending || setPoolVisible.isPending}
+                />
+              </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
-                <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>
-                  {updateKey.isPending || setMaxCredits.isPending ? '保存中…' : '保存'}
+                <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending || setPoolVisible.isPending}>
+                  {updateKey.isPending || setMaxCredits.isPending || setPoolVisible.isPending ? '保存中…' : '保存'}
                 </Button>
               </DialogFooter>
             </form>

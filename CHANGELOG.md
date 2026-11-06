@@ -6,7 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-主题：**合并 upstream master、多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复、客户端 Key 一键导出（直接使用 / CC Switch），以及上下文窗口改按上游取值、不再兜底 200K**。
+主题：**合并 upstream master、多客户端共用凭据时的限流排队、上游 4xx 不再变成 502、无参工具调用与正文截断修复、客户端 Key 一键导出（直接使用 / CC Switch）、客户端用 Key 查剩余额度，以及上下文窗口改按上游取值、不再兜底 200K**。
+
+### 💰 用 Key 查剩余额度（`GET /v1/usage`）
+
+- 新增 `GET /v1/usage` 和 `/cc/v1/usage`：客户端用调模型的同一把 Key（`Authorization: Bearer` 或 `x-api-key`）查这把 Key 的已用、上限和剩余积分。查询不计调用次数、不占额度；Key 停用或用完时也回 200，用 `state` 说明；Key 不存在回 401。回包格式见 README「查剩余额度」，顶层几项兼容 CC Switch 的 Sub2API 用量模板。
+- 客户端 Key 新增「查用量时能看池子」开关（默认关，`POST /api/admin/client-keys/{id}/pool-visible`，在「编辑 Key」里设置，列表里标「看池子」）。打开的 Key 回包里多一块 `pool`：它能用的 Kiro 账号剩余积分之和，来自后台每 5 分钟刷新的余额。没打开的 Key 回包里没有任何池子的数。
+- CC Switch 导入链接带上用量查询脚本，导入后卡片显示剩余积分（每 10 分钟自动查一次）；「直接使用」页加了查余额的 `curl`。
 
 ### 🔀 合并 upstream v0.9.2（ZyphrZero/kiro.rs master @ `711c3e6`）
 

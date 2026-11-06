@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
+use crate::admin::balance_board::SharedBalanceBoard;
 use crate::admin::client_keys::{KeyAuth, SharedClientKeyManager};
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
@@ -52,6 +53,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 各账号最近查到的 Kiro 余额（由 Admin 服务同步），`/v1/usage` 汇总池子用
+    pub balance_board: Option<SharedBalanceBoard>,
 }
 
 impl AppState {
@@ -70,6 +73,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            balance_board: None,
         }
     }
 
@@ -101,6 +105,12 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    /// 注入账号余额表（`/v1/usage` 汇总池子用）
+    pub fn with_balance_board(mut self, board: Option<SharedBalanceBoard>) -> Self {
+        self.balance_board = board;
         self
     }
 }

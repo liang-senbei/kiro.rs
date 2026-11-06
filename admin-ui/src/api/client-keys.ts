@@ -69,6 +69,15 @@ export async function setClientKeyMaxCredits(
   return data
 }
 
+/** 打开或关闭这把 Key 在 /v1/usage 里看池子剩余积分的权限 */
+export async function setClientKeyPoolVisible(
+  id: number,
+  poolVisible: boolean,
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/client-keys/${id}/pool-visible`, { poolVisible })
+  return data
+}
+
 export async function rotateClientKey(id: number): Promise<CreateClientKeyResponse> {
   const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
   return data

@@ -26,6 +26,7 @@ use super::{
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
         rollback_image_update, rotate_client_key, set_account_rpm_limit_config,
         set_account_throttle_config, set_client_key_disabled, set_client_key_max_credits,
+        set_client_key_pool_visible,
         set_credential_disabled, set_credential_metadata_schema, set_credential_overage,
         set_credential_priority, set_custom_models, set_global_proxy, set_load_balancing_mode,
         set_api_domain, set_cache_metering_config, set_session_affinity_config,
@@ -210,6 +211,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/client-keys/{id}/max-credits",
             post(set_client_key_max_credits),
+        )
+        .route(
+            "/client-keys/{id}/pool-visible",
+            post(set_client_key_pool_visible),
         )
         .route(
             "/client-keys/{id}/reset-stats",

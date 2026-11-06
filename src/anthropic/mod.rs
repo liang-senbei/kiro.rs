@@ -8,6 +8,7 @@
 //! - `GET /v1/models` - 获取可用模型列表
 //! - `POST /v1/messages` - 创建消息（对话）
 //! - `POST /v1/messages/count_tokens` - 计算 token 数量
+//! - `GET /v1/usage` - 用调模型的 Key 查剩余额度（《用量接口 v1》；`/cc/v1/usage` 相同）
 //!
 //! ## Claude Code 兼容端点 (/cc/v1)
 //! - `POST /cc/v1/messages` - 创建消息（流式内容即时发送，最终用量由 message_delta 更正，确保 input_tokens 准确）
@@ -25,6 +26,7 @@
 pub mod cache_metering;
 mod converter;
 mod handlers;
+mod key_usage;
 mod middleware;
 mod openai;
 mod responses;

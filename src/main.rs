@@ -347,6 +347,9 @@ async fn main() {
         });
     }
 
+    // 各账号最近查到的余额：Admin 服务写，`/v1/usage` 读
+    let balance_board: admin::balance_board::SharedBalanceBoard = Default::default();
+
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -356,6 +359,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(balance_board.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -378,7 +382,8 @@ async fn main() {
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
                     )
-                    .with_cache_meter(cache_meter.clone());
+                    .with_cache_meter(cache_meter.clone())
+                    .with_balance_board(balance_board.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
@@ -434,6 +439,7 @@ async fn main() {
     tracing::info!("  POST /v1/messages/count_tokens");
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/responses");
+    tracing::info!("  GET  /v1/usage");
     tracing::info!("  POST /cc/v1/messages");
     tracing::info!("  POST /cc/v1/messages/count_tokens");
     if admin_enabled {

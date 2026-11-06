@@ -303,6 +303,8 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     kiro_provider: Option<Arc<KiroProvider>>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    /// 余额缓存的只读副本，供 `/v1/usage` 汇总池子剩余积分
+    balance_board: Option<super::balance_board::SharedBalanceBoard>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
@@ -662,6 +664,7 @@ impl AdminService {
             token_manager,
             kiro_provider: None,
             balance_cache: Mutex::new(balance_cache),
+            balance_board: None,
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
@@ -2928,7 +2931,40 @@ impl AdminService {
         self.save_balance_cache();
     }
 
+    /// 把余额缓存同步给 `/v1/usage`，并在启用时立即同步一次
+    pub fn with_balance_board(mut self, board: super::balance_board::SharedBalanceBoard) -> Self {
+        self.balance_board = Some(board);
+        self.publish_balance_board();
+        self
+    }
+
+    fn publish_balance_board(&self) {
+        let Some(board) = &self.balance_board else {
+            return;
+        };
+        let entries = self
+            .balance_cache
+            .lock()
+            .iter()
+            .map(|(id, cached)| {
+                (
+                    *id,
+                    super::balance_board::BoardEntry {
+                        remaining: cached.data.remaining,
+                        usage_limit: cached.data.usage_limit,
+                        current_usage: cached.data.current_usage,
+                        next_reset_at: cached.data.next_reset_at,
+                        cached_at: cached.cached_at,
+                    },
+                )
+            })
+            .collect();
+        board.replace_all(entries);
+    }
+
     fn save_balance_cache(&self) {
+        // 每次改动余额缓存后都会走到这里，顺带同步给 `/v1/usage`
+        self.publish_balance_board();
         let path = match &self.cache_path {
             Some(p) => p,
             None => return,

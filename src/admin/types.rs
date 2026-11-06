@@ -1014,6 +1014,8 @@ pub struct ClientKeyItem {
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
+    /// 能否在 `/v1/usage` 里看到池子剩余积分
+    pub pool_visible: bool,
 }
 
 /// 客户端 Key 列表响应
@@ -1036,6 +1038,9 @@ pub struct CreateClientKeyRequest {
     /// 积分使用上限（可选；None / 省略表示不限制）
     #[serde(default)]
     pub max_credits: Option<f64>,
+    /// 能否在 `/v1/usage` 里看到池子剩余积分（省略为否）
+    #[serde(default)]
+    pub pool_visible: bool,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1079,6 +1084,13 @@ pub struct SetClientKeyMaxCreditsRequest {
     /// 积分上限；null 或省略表示取消限制
     #[serde(default)]
     pub max_credits: Option<f64>,
+}
+
+/// 打开或关闭客户端 Key 看池子余额的权限
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetClientKeyPoolVisibleRequest {
+    pub pool_visible: bool,
 }
 
 // ============ IdC 设备授权登录 ============

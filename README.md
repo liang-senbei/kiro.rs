@@ -301,6 +301,7 @@ codex
 | `POST` | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容入口 |
 | `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
 | `POST` | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens |
+| `GET` | `/v1/usage`、`/cc/v1/usage` | 用调模型的 Key 查剩余额度，见[查剩余额度](#查剩余额度v1usage) |
 
 ### OpenAI 兼容
 
@@ -837,7 +838,38 @@ JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退
 - **直接使用**：给出 Claude Code 的 `~/.claude/settings.json` 片段、macOS / Linux 与 PowerShell 的环境变量、连通性测试 `curl`，以及 Anthropic / OpenAI 兼容客户端的 base URL。连接只设置 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，不设置 `ANTHROPIC_API_KEY`（两者同时存在时 Claude Code 会提示凭证冲突）；选了模型时再加 `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`。
 - **CC Switch 导入**：一键唤起 [CC Switch](https://ccswitch.io)，导入为 Claude Code 供应商，接口格式 Anthropic 原生（`apiFormat=anthropic`），Claude Code 直连本服务，不需要 CC Switch 本地路由。链接形如 `ccswitch://v1/import?resource=provider&app=claude&name=…&endpoint=…&apiKey=…&apiFormat=anthropic`，选了模型时带上 `model` / `opusModel` / `sonnetModel` / `haikuModel`，`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 放在 Base64 的 `config` 里（CC Switch v3.16.0 起才保留这类变量）；没选模型则沿用 Claude Code 自带的模型列表。也可以复制链接发给 Key 的使用者自己点开。建议 CC Switch v4.0.10 及以上。
 
+CC Switch 导入链接同时带上用量查询脚本（`usageScript`，`usageEnabled=true`，每 10 分钟自动查一次），导入后供应商卡片直接显示剩余积分，见下一节。「直接使用」页也有一条查余额的 `curl`。
+
 导出时 Admin UI 通过 `POST /api/admin/client-keys/{id}/export` 取回明文 Key（响应带 `Cache-Control: no-store`）。导入链接和配置片段都带着明文 Key，只发给这把 Key 的使用者。
+
+### 查剩余额度（`/v1/usage`）
+
+客户端用调模型的同一把 Key 查还剩多少：
+
+```bash
+curl https://kiro.example.com/v1/usage -H 'Authorization: Bearer sk-…'
+```
+
+`x-api-key` 也认；走 `/cc` 的客户端查 `/cc/v1/usage`，结果相同。查询不计调用次数、不占额度；Key 停用或额度用完时照样回 200，用 `state` 说明（`active` / `disabled` / `exhausted`）。Key 不存在回 401 `{"object":"error","error":{"code":"invalid_key",…}}`。
+
+```json
+{
+  "object": "usage",
+  "version": 1,
+  "state": "active",
+  "updatedAt": "2026-11-07T01:20:00Z",
+  "key":  { "name": "张三", "unit": "credits", "limit": 100, "used": 12.4, "remaining": 87.6, "resetsAt": null, "expiresAt": null },
+  "pool": { "unit": "credits", "limit": 2000, "used": 50, "remaining": 1950, "resetsAt": "2026-12-01T00:00:00Z", "updatedAt": "2026-11-07T01:18:00Z" },
+  "stats": { "calls": 42, "inputTokens": 120000, "outputTokens": 8000, "lastUsedAt": "2026-11-07T01:10:00Z" },
+  "isValid": true, "status": "正常", "planName": "张三", "remaining": 87.6, "unit": "积分",
+  "quota": { "used": 12.4, "limit": 100, "unit": "积分" }
+}
+```
+
+- `key`：这把 Key 自己的积分。没设积分上限时不给 `limit` 和 `remaining`。
+- `pool`：这把 Key 能用的 Kiro 账号（按它绑定的分组，未绑定就是全部账号）还剩多少积分，取自后台每 5 分钟刷新一次的账号余额，`updatedAt` 是其中最旧那份的时间。手动停用的账号不算；额度用完被停用的算在 `limit` 里，剩余记 0。**只有在「编辑 Key」里打开了「查用量时能看池子」的 Key 才带 `pool`**，默认关：Key 发给别人时，对方看不到池子大小。打开了但一个账号的余额都还没查到时回 503 + `Retry-After`。
+- `isValid` / `status` / `planName` / `remaining` / `unit` / `quota` 是给 CC Switch「Sub2API」用量模板读的：Key 设了上限时是 Key 的数；没设上限、又能看池子时是池子的数；都没有就不给 `remaining` 和 `quota`。
+- 数字最多两位小数，时间都是 UTC、以 `Z` 结尾。
 
 Admin 还提供：
 

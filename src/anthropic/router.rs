@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::admin::balance_board::SharedBalanceBoard;
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::SharedTraceStore;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
@@ -18,6 +19,7 @@ use crate::model::config::ToolCompatibilityMode;
 use super::{
     cache_metering::SharedCacheMeter,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    key_usage::get_key_usage,
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
     responses::post_responses,
@@ -68,6 +70,7 @@ pub fn create_router(
         usage_aggregator,
         cache_meter,
         trace_store,
+        None,
     )
 }
 
@@ -82,6 +85,7 @@ pub fn create_router_with_shared_provider(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    balance_board: Option<SharedBalanceBoard>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -90,6 +94,7 @@ pub fn create_router_with_shared_provider(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_balance_board(balance_board);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
@@ -101,7 +106,9 @@ pub fn create_router_with_shared_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ));
+        ))
+        // 加在鉴权层之后：查用量不计调用次数，停用 / 用完的 Key 也能查到自己的状态
+        .route("/usage", get(get_key_usage));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式内容即时发送，最终用量由 message_delta 更正
@@ -111,7 +118,8 @@ pub fn create_router_with_shared_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ));
+        ))
+        .route("/usage", get(get_key_usage));
 
     Router::new()
         .nest("/v1", v1_routes)

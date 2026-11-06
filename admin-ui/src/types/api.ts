@@ -463,6 +463,8 @@ export interface ClientKeyItem {
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
+  /** 能否在 /v1/usage 里看到池子（可用 Kiro 账号）的剩余积分 */
+  poolVisible: boolean
 }
 
 export interface ClientKeysResponse {
@@ -476,6 +478,8 @@ export interface CreateClientKeyRequest {
   group?: string
   /** 积分使用上限（可选，不传表示不限制） */
   maxCredits?: number
+  /** 能否在 /v1/usage 里看到池子剩余积分（不传为否） */
+  poolVisible?: boolean
 }
 
 /** 创建 / 轮换响应：明文 Key（之后可经导出接口再次取回） */

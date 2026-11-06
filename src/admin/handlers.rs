@@ -1031,6 +1031,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         max_credits: k.max_credits,
         group: k.group.clone(),
         is_system: k.is_system,
+        pool_visible: k.pool_visible,
     }
 }
 
@@ -1087,6 +1088,9 @@ pub async fn create_client_key(
     if let Some(v) = payload.max_credits {
         state.client_keys.set_max_credits(entry.id, Some(v));
     }
+    if payload.pool_visible {
+        state.client_keys.set_pool_visible(entry.id, true);
+    }
     Json(CreateClientKeyResponse {
         id: entry.id,
         key: entry.key,
@@ -1119,6 +1123,33 @@ pub async fn set_client_key_max_credits(
         let msg = match payload.max_credits {
             Some(v) => format!("Key #{} 积分上限已设为 {:.2}", id, v),
             None => format!("Key #{} 已取消积分上限", id),
+        };
+        Json(SuccessResponse::new(msg)).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
+}
+
+/// POST /api/admin/client-keys/:id/pool-visible
+/// 打开或关闭这把 Key 在 `/v1/usage` 里看池子余额的权限。body: { "poolVisible": bool }
+pub async fn set_client_key_pool_visible(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<super::types::SetClientKeyPoolVisibleRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    if state.client_keys.set_pool_visible(id, payload.pool_visible) {
+        let msg = if payload.pool_visible {
+            format!("Key #{} 已可查看池子余额", id)
+        } else {
+            format!("Key #{} 已不再显示池子余额", id)
         };
         Json(SuccessResponse::new(msg)).into_response()
     } else {

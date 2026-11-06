@@ -13,7 +13,7 @@ import { exportClientKey, getClientKeyModels } from '@/api/client-keys'
 import { getCurrentCredentialModels, getCustomModels } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import {
-  anthropicBaseUrl, ccSwitchImportLink, claudeCodeModelEnv, claudeCodeSettingsJson, curlTest,
+  anthropicBaseUrl, ccSwitchImportLink, claudeCodeModelEnv, claudeCodeSettingsJson, curlTest, usageCurl,
   hasExtraModelEnv, isLocalAddress, maskSecret, normalizeBaseUrl, openAiBaseUrl, powershellExports, shellExports,
   type ExportEndpointMode, type ExportModel, type ExportModelSlots, type ExportTarget,
 } from '@/lib/client-key-export'
@@ -433,6 +433,11 @@ export function ClientKeyExportDialog({
                   text={curlTest(target)}
                   display={show(curlTest(target))}
                 />
+                <Snippet
+                  title="查剩余积分（不计调用次数）"
+                  text={usageCurl(target)}
+                  display={show(usageCurl(target))}
+                />
                 <div className="rounded-md border border-border p-2.5 text-[11px] text-muted-foreground">
                   <div className="mb-1 font-medium text-foreground">其它客户端</div>
                   <div className="grid gap-1 sm:grid-cols-[auto_1fr] sm:gap-x-3">
@@ -481,6 +486,10 @@ export function ClientKeyExportDialog({
                   </Button>
                 </div>
                 <div className="space-y-1 text-[11px] text-muted-foreground">
+                  <p>
+                    导入后卡片上会显示剩余积分（每 10 分钟自动查一次 <code>/v1/usage</code>，不计调用次数）：
+                    Key 设了积分上限就显示这把 Key 还剩多少；在「编辑 Key」里打开「查用量时能看池子」的，再多一行池子剩余。
+                  </p>
                   <p>
                     浏览器会先询问是否打开 CC Switch，选「打开」，在 CC Switch 的确认框里核对后点「导入」。
                     确认框底部的「导入后立即切换」决定是否马上用它。点了没反应？可能还没安装，先

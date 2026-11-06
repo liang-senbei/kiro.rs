@@ -191,8 +191,64 @@ export function curlTest(target: ExportTarget): string {
   ].join('\n')
 }
 
+/** 用这把 Key 查剩余额度（`GET /v1/usage`，查询不计调用次数） */
+export function usageCurl(target: ExportTarget): string {
+  return [
+    `curl ${shellQuote(`${anthropicBaseUrl(target)}/v1/usage`)} \\`,
+    `  -H ${shellQuote(`Authorization: Bearer ${target.apiKey}`)}`,
+  ].join('\n')
+}
+
 /**
- * CC Switch 一键导入链接：Claude Code 供应商，Anthropic 原生格式。
+ * CC Switch 用量查询脚本：查 `/v1/usage`（《用量接口 v1》），卡片上显示剩余积分。
+ *
+ * 能看池子的 Key 多一行「池子」；Key 自己限额时一行 Key 的额度。`{{baseUrl}}` 是供应商地址，
+ * 走 `/cc` 时拼出来是 `/cc/v1/usage`，两个地址服务端都有。
+ */
+export const CC_SWITCH_USAGE_SCRIPT = `({
+  request: {
+    url: "{{baseUrl}}".replace(/\\/+$/, "").replace(/\\/v1$/, "") + "/v1/usage",
+    method: "GET",
+    headers: {
+      "Authorization": "Bearer {{apiKey}}",
+      "User-Agent": "cc-switch/1.0"
+    }
+  },
+  extractor: function (response) {
+    var valid = response.isValid !== false;
+    var key = response.key || {};
+    var rows = [];
+    if (response.pool) {
+      rows.push({
+        planName: "池子",
+        remaining: response.pool.remaining,
+        used: response.pool.used,
+        total: response.pool.limit
+      });
+    }
+    if (typeof key.limit === "number") {
+      rows.push({
+        planName: key.name || response.planName,
+        remaining: key.remaining,
+        used: key.used,
+        total: key.limit
+      });
+    }
+    if (!rows.length) rows.push({ planName: response.planName, used: key.used });
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].unit = "积分";
+      rows[i].isValid = valid;
+      if (!valid) rows[i].invalidMessage = String(response.status || "查询失败");
+    }
+    return rows.length === 1 ? rows[0] : rows;
+  }
+})`
+
+/** CC Switch 自动查询用量的间隔（分钟）；《用量接口 v1》要求自动刷新不快于 5 分钟一次 */
+const CC_SWITCH_USAGE_INTERVAL_MINUTES = 10
+
+/**
+ * CC Switch 一键导入链接：Claude Code 供应商，Anthropic 原生格式，带用量查询脚本。
  *
  * 链接含明文 Key，等同 Key 本身；只在用户点击时生成，不写进页面源码。
  */
@@ -204,6 +260,10 @@ export function ccSwitchImportLink(target: ExportTarget, providerName: string): 
     endpoint: anthropicBaseUrl(target),
     apiKey: target.apiKey,
     apiFormat: 'anthropic',
+    usageScript: base64Utf8(CC_SWITCH_USAGE_SCRIPT),
+    // v4.0.10 前的版本带了脚本也默认不启用，显式写上
+    usageEnabled: 'true',
+    usageAutoInterval: String(CC_SWITCH_USAGE_INTERVAL_MINUTES),
   })
   // 模型槽位走 CC Switch 的专用参数（写成同名 ANTHROPIC_* 变量），其余变量放进 Base64 的 config.env
   const extraEnv: Record<string, string> = {}

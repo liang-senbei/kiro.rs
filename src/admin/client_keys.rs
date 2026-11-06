@@ -61,6 +61,10 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+    /// 能否在 `/v1/usage` 里看到池子（这把 Key 能用的 Kiro 账号）剩余积分。
+    /// 默认关：Key 发给别人时不暴露池子大小，只给自己用的 Key 打开。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pool_visible: bool,
 }
 
 /// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
@@ -202,6 +206,7 @@ impl ClientKeyManager {
             max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
+            pool_visible: false,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -246,6 +251,7 @@ impl ClientKeyManager {
                     max_credits: None,
                     group: None,
                     is_system: true,
+                    pool_visible: false,
                 },
             );
             changed = true;
@@ -499,6 +505,37 @@ impl ClientKeyManager {
         }
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
         KeyAuth::Ok(id)
+    }
+
+    /// 打开或关闭这把 Key 在 `/v1/usage` 里看池子余额的权限
+    pub fn set_pool_visible(&self, id: u64, visible: bool) -> bool {
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                e.pool_visible = visible;
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
+    }
+
+    /// 只读查找：常量时间比对所有 Key（含已停用的），不更新调用次数和最后使用时间。
+    ///
+    /// 给 `/v1/usage` 用：停用、额度用完的 Key 也要能查到自己的状态。
+    pub fn lookup(&self, presented: &str) -> Option<ClientKey> {
+        let inner = self.inner.read();
+        let mut hit: Option<&ClientKey> = None;
+        for ck in inner.entries.values() {
+            if ck.key.as_bytes().ct_eq(presented.as_bytes()).into() {
+                hit = Some(ck);
+                // 不 break，完整扫描以保持常量时间
+            }
+        }
+        hit.cloned()
     }
 
     /// 设置或清除单个 Key 的积分使用上限。`None` 表示取消限制。

@@ -8,6 +8,7 @@ import {
   resetClientKeyStats,
   rotateClientKey,
   setClientKeyMaxCredits,
+  setClientKeyPoolVisible,
 } from '@/api/client-keys'
 import type { CreateClientKeyRequest, UpdateClientKeyRequest } from '@/types/api'
 
@@ -74,6 +75,15 @@ export function useSetClientKeyMaxCredits() {
   return useMutation({
     mutationFn: ({ id, maxCredits }: { id: number; maxCredits: number | null }) =>
       setClientKeyMaxCredits(id, maxCredits),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-keys'] }),
+  })
+}
+
+export function useSetClientKeyPoolVisible() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, poolVisible }: { id: number; poolVisible: boolean }) =>
+      setClientKeyPoolVisible(id, poolVisible),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['client-keys'] }),
   })
 }

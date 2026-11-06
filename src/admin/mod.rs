@@ -24,6 +24,7 @@ mod router;
 mod service;
 pub mod types;
 mod binary_update;
+pub mod balance_board;
 pub mod client_keys;
 pub mod groups;
 pub mod usage_stats;

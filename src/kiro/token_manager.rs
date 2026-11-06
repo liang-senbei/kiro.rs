@@ -1329,7 +1329,7 @@ pub struct IdcReloginCredentials {
 ///
 /// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
 /// - `group = Some(g)`：仅匹配 `cred_groups` 包含 `g` 的账号。
-fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
+pub(crate) fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
     match group {
         None => true,
         Some(g) => cred_groups.iter().any(|cg| cg == g),
