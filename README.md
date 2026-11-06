@@ -868,7 +868,7 @@ curl https://kiro.example.com/v1/usage -H 'Authorization: Bearer sk-…'
 
 - `key`：这把 Key 自己的积分。没设积分上限时不给 `limit` 和 `remaining`。
 - `pool`：这把 Key 能用的 Kiro 账号（按它绑定的分组，未绑定就是全部账号）还剩多少积分，取自后台每 5 分钟刷新一次的账号余额（刷新失败时用上次查到的数），`updatedAt` 是其中最旧那份的时间，`resetsAt` 是最早的下次重置时间（已经过去的不算）。手动停用的账号不算；额度用完被停用的算在 `limit` 里，剩余记 0。**只有在「编辑 Key」里打开了「查用量时能看池子」的 Key 才带 `pool`**，默认关：Key 发给别人时，对方看不到池子大小。
-  - 打开了、但池子里一个账号的余额都还没查到过：不限额的 Key 回 503 + `Retry-After`（能显示的只有池子）；Key 自己限额、停用或用完时照样回 200，只是不带 `pool`。
+  - 打开了、但池子里没用完的账号一份余额都还没查到过（剩多少确实不知道）：不限额的 Key 回 503 + `Retry-After`（能显示的只有池子）；Key 自己限额、停用或用完时照样回 200，只是不带 `pool`。池子里只剩额度用完的账号时，即使没查到过余额也回 `remaining: 0`。
   - 余额后台刷新随 Admin 服务运行，没配 `adminApiKey` 的实例不返回 `pool`。
 - `isValid` / `status` / `planName` / `remaining` / `unit` / `quota` 是给 CC Switch「Sub2API」用量模板读的：Key 设了上限时是 Key 的数；没设上限、又能看池子时是池子的数；都没有就不给 `remaining` 和 `quota`。
 - 数字最多两位小数，时间都是 UTC、以 `Z` 结尾。

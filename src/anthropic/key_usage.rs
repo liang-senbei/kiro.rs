@@ -168,7 +168,7 @@ fn pool_is_all_there_is(key: &ClientKey) -> bool {
 #[derive(Debug, PartialEq)]
 pub enum PoolLookup {
     Known(PoolBlock),
-    /// 有账号，但一份余额都还没查到过
+    /// 有没用完的账号，但它们一份余额都还没查到过（剩多少确实不知道）
     NotYetKnown,
     /// 这个实例没有余额表（未启用 Admin API，余额后台刷新不运行）
     Unsupported,

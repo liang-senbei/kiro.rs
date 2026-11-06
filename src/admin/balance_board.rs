@@ -72,6 +72,22 @@ impl BalanceBoard {
         }
     }
 
+    /// 只保留这些凭据的余额，其余移除。
+    ///
+    /// 启动时用：删除凭据时正在进行的余额查询可能在 `forget` 之后又把它写回来，
+    /// 重启后新凭据若复用了这个 id，会误用已删账号的余额。
+    pub fn retain(&self, keep: &std::collections::HashSet<u64>) {
+        let changed = {
+            let mut board = self.entries.write();
+            let before = board.len();
+            board.retain(|id, _| keep.contains(id));
+            board.len() != before
+        };
+        if changed {
+            self.save();
+        }
+    }
+
     /// 凭据删除后移除它的余额
     pub fn forget(&self, id: u64) {
         let removed = self.entries.write().remove(&id).is_some();
@@ -181,6 +197,16 @@ mod tests {
         board.publish([(1, entry(10.0, 1.0))]);
         board.forget(1);
         assert!(board.snapshot().is_empty());
+    }
+
+    #[test]
+    fn retain_drops_credentials_that_no_longer_exist() {
+        let board = BalanceBoard::default();
+        board.publish([(1, entry(10.0, 1.0)), (9, entry(5.0, 1.0))]);
+        board.retain(&std::collections::HashSet::from([1]));
+        let snap = board.snapshot();
+        assert!(snap.contains_key(&1));
+        assert!(!snap.contains_key(&9));
     }
 
     #[test]

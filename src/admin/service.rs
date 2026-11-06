@@ -2942,6 +2942,17 @@ impl AdminService {
         }
         self.balance_board = Some(board);
         self.publish_balance_board();
+        // 去掉已删除凭据的余额（见 BalanceBoard::retain），免得重启后复用 id 的新凭据误用
+        if let Some(board) = &self.balance_board {
+            let existing: HashSet<u64> = self
+                .token_manager
+                .snapshot()
+                .entries
+                .iter()
+                .map(|c| c.id)
+                .collect();
+            board.retain(&existing);
+        }
         self
     }
 
