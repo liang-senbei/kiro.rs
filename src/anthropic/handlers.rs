@@ -103,7 +103,9 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
-        if status == "success" && self.key_id != 0 {
+        // id 0 是 config.json apiKey 同步来的系统 Key，也是一条普通的客户端 Key 记录：
+        // 用量和积分照样累计（积分上限、`/v1/usage` 都靠它）。没有这条记录时 record_usage 什么都不做
+        if status == "success" {
             if let Some(m) = &self.client_keys {
                 m.record_usage(
                     self.key_id,
@@ -2761,6 +2763,27 @@ async fn handle_cc_stream_request(
 mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
+
+    #[test]
+    fn system_key_usage_is_recorded_like_any_client_key() {
+        let keys = std::sync::Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+        keys.sync_system_key("默认密钥".into(), None, "sk-system".into());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
+            Some(keys.clone()),
+            None,
+            None,
+        );
+
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        hook.record(3, 4103, 1, 0, 0, 0.0053, "success");
+        // 失败的请求不计入 Key 的用量
+        hook.record(3, 999, 999, 0, 0, 9.0, "error");
+
+        let key = keys.get(0).unwrap();
+        assert_eq!(key.total_input_tokens, 4103);
+        assert_eq!(key.total_output_tokens, 1);
+        assert!((key.total_credits - 0.0053).abs() < 1e-9);
+    }
 
     #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {
